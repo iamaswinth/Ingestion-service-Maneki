@@ -1,0 +1,14 @@
+# Secrets & scraped output
+.env
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Firecrawl self-hosted clone (lives as a sibling, but ignore if placed here)
+firecrawl/
+firecrawl-selfhost/

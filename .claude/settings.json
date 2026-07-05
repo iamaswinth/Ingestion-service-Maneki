@@ -1,0 +1,24 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(docker compose -f \"c:\\\\Users\\\\iamas\\\\Storage\\\\REAL_MANEKI\\\\firecrawl-selfhost\\\\docker-compose.yaml\" build 2>&1 | Tee-Object -FilePath \"$env:TEMP\\\\fc_build.log\" | Select-Object -Last 5)",
+      "WebFetch(domain:docs.firecrawl.dev)",
+      "PowerShell(if \\(Test-Path \"$env:TEMP\\\\fc_build.log\"\\) { Get-Content \"$env:TEMP\\\\fc_build.log\" -Tail 8 } else { \"no log yet\" })",
+      "PowerShell(python -m venv .venv)",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -m pip install --quiet --upgrade pip)",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -m pip install --quiet -r requirements.txt)",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -c \"import fastapi, firecrawl, uvicorn; print\\('deps ok'\\)\")",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -c \"from app.main import app; print\\('app imports ok'\\); print\\([r.path for r in app.routes if hasattr\\(r,'path'\\)]\\)\")",
+      "PowerShell(Get-Content \"$env:TEMP\\\\fc_build.log\" -Tail 4)",
+      "PowerShell(docker compose -f \"c:\\\\Users\\\\iamas\\\\Storage\\\\REAL_MANEKI\\\\firecrawl-selfhost\\\\docker-compose.yaml\" up -d 2>&1)",
+      "PowerShell(docker compose -f \"c:\\\\Users\\\\iamas\\\\Storage\\\\REAL_MANEKI\\\\firecrawl-selfhost\\\\docker-compose.yaml\" ps --format \"table {{.Name}}\\\\t{{.Status}}\")",
+      "PowerShell($env:DATA_DIR=\"data\"; Start-Process -FilePath \".\\\\.venv\\\\Scripts\\\\python.exe\" -ArgumentList \"-m\",\"uvicorn\",\"app.main:app\",\"--port\",\"8000\" -RedirectStandardOutput \"$env:TEMP\\\\uvicorn.log\" -RedirectStandardError \"$env:TEMP\\\\uvicorn.err\" -NoNewWindow; Start-Sleep -Seconds 4; try { Invoke-RestMethod \"http://localhost:8000/health\" -TimeoutSec 10 | ConvertTo-Json } catch { \"health error: $\\($_.Exception.Message\\)\"; Get-Content \"$env:TEMP\\\\uvicorn.err\" -Tail 15 })",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -m pip install --quiet beautifulsoup4 markdownify)",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -c \"from app.sections import extract_sections; from app.main import app; print\\('imports ok'\\)\")",
+      "PowerShell(.\\\\.venv\\\\Scripts\\\\python.exe -c \"from app.main import app; from app.scraper import _scrape_options; print\\('imports ok'\\); print\\(_scrape_options\\(3000\\)\\)\")"
+    ],
+    "additionalDirectories": [
+      "c:\\Users\\iamas\\Storage\\REAL_MANEKI\\firecrawl-selfhost"
+    ]
+  }
+}
