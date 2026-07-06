@@ -297,7 +297,16 @@ async def _search_hybrid(
 
     query = f"""
         WITH q AS (
-            SELECT websearch_to_tsquery('english', ${question_idx}) AS tsq
+            -- websearch_to_tsquery ANDs every bare term together, so a
+            -- multi-word conversational query only matches a chunk that
+            -- happens to contain *all* of its words. Rewriting the top-level
+            -- ANDs to ORs (leaving quoted-phrase proximity operators intact)
+            -- turns this into BM25-style "more/rarer matching terms rank
+            -- higher" scoring via ts_rank_cd, instead of all-or-nothing.
+            SELECT to_tsquery(
+                'english',
+                replace(websearch_to_tsquery('english', ${question_idx})::text, ' & ', ' | ')
+            ) AS tsq
         ),
         vector_candidates AS (
             SELECT chunk_id, parent_chunk_id,
