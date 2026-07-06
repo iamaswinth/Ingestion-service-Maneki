@@ -57,6 +57,35 @@ def _text_of(response) -> str:
     raise ValueError(f"No text content block in response (stop_reason={response.stop_reason})")
 
 
+async def _create_structured(
+    *, model: str, max_tokens: int, system: str, schema: dict, user_content: str
+) -> str:
+    """One structured (json_schema) call, with one retry at double the token
+    budget if the first attempt was truncated before any text was written.
+
+    A single verbose generation (a bigger site producing more objections/value
+    props to critique, say) can occasionally overrun even a generous static
+    max_tokens — this is ordinary LLM output-length variance, not a bug worth
+    failing the whole graph run over, so retry once with headroom before
+    surfacing an error.
+    """
+    budget = max_tokens
+    for attempt in range(2):
+        response = await _get_client().messages.create(
+            model=model,
+            max_tokens=budget,
+            system=system,
+            output_config={"format": {"type": "json_schema", "schema": schema}},
+            messages=[{"role": "user", "content": user_content}],
+        )
+        try:
+            return _text_of(response)
+        except ValueError:
+            if attempt == 1:
+                raise
+            budget *= 2
+
+
 class SalesScriptState(TypedDict):
     tenant_id: str
     job_id: str
@@ -80,14 +109,13 @@ def _dispatch_extract(state: SalesScriptState) -> list[Send]:
 @traceable(name="extract_facts_llm", run_type="llm")
 async def _call_extract_facts(page: dict) -> str:
     async with _extract_semaphore:
-        response = await _get_client().messages.create(
+        return await _create_structured(
             model=settings.sales_script_extract_model,
-            max_tokens=1024,
+            max_tokens=1536,
             system=prompts.EXTRACT_FACTS_SYSTEM_PROMPT,
-            output_config={"format": {"type": "json_schema", "schema": _EXTRACT_FACTS_SCHEMA}},
-            messages=[{"role": "user", "content": prompts.build_extract_facts_prompt(page)}],
+            schema=_EXTRACT_FACTS_SCHEMA,
+            user_content=prompts.build_extract_facts_prompt(page),
         )
-    return _text_of(response)
 
 
 async def extract_facts_one(payload: dict) -> dict:
@@ -98,16 +126,13 @@ async def extract_facts_one(payload: dict) -> dict:
 
 @traceable(name="derive_icp_llm", run_type="llm")
 async def _call_derive_icp(facts: list[str]) -> str:
-    response = await _get_client().messages.create(
+    return await _create_structured(
         model=settings.sales_script_model,
-        max_tokens=2048,
+        max_tokens=3072,
         system=prompts.DERIVE_ICP_SYSTEM_PROMPT,
-        output_config={
-            "format": {"type": "json_schema", "schema": IcpProfile.model_json_schema()}
-        },
-        messages=[{"role": "user", "content": prompts.build_derive_icp_prompt(facts)}],
+        schema=IcpProfile.model_json_schema(),
+        user_content=prompts.build_derive_icp_prompt(facts),
     )
-    return _text_of(response)
 
 
 async def derive_icp(state: SalesScriptState) -> dict:
@@ -117,16 +142,13 @@ async def derive_icp(state: SalesScriptState) -> dict:
 
 @traceable(name="draft_script_llm", run_type="llm")
 async def _call_draft_script(prompt: str) -> str:
-    response = await _get_client().messages.create(
+    return await _create_structured(
         model=settings.sales_script_model,
-        max_tokens=4096,
+        max_tokens=6144,
         system=prompts.DRAFT_SCRIPT_SYSTEM_PROMPT,
-        output_config={
-            "format": {"type": "json_schema", "schema": SalesScript.model_json_schema()}
-        },
-        messages=[{"role": "user", "content": prompt}],
+        schema=SalesScript.model_json_schema(),
+        user_content=prompt,
     )
-    return _text_of(response)
 
 
 async def draft_script(state: SalesScriptState) -> dict:
@@ -146,19 +168,13 @@ async def draft_script(state: SalesScriptState) -> dict:
 
 @traceable(name="critique_llm", run_type="llm")
 async def _call_critique(facts: list[str], script: dict) -> str:
-    response = await _get_client().messages.create(
+    return await _create_structured(
         model=settings.sales_script_model,
-        max_tokens=4096,
+        max_tokens=6144,
         system=prompts.CRITIQUE_SYSTEM_PROMPT,
-        output_config={
-            "format": {
-                "type": "json_schema",
-                "schema": SalesScriptCritique.model_json_schema(),
-            }
-        },
-        messages=[{"role": "user", "content": prompts.build_critique_prompt(facts, script)}],
+        schema=SalesScriptCritique.model_json_schema(),
+        user_content=prompts.build_critique_prompt(facts, script),
     )
-    return _text_of(response)
 
 
 async def critique_node(state: SalesScriptState) -> dict:

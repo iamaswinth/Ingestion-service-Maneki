@@ -70,7 +70,9 @@ CRITIQUE_SYSTEM_PROMPT = (
     "testimonials, policies) that is not directly supported by the provided "
     "facts. Do not flag stylistic choices or missing information — only "
     "unsupported or contradicted claims. Pass only if there are zero such "
-    "issues."
+    "issues. Keep each issue to one short sentence naming the claim and why "
+    "it's unsupported — no lengthy justification or quoting large passages "
+    "back."
 )
 
 
