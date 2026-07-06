@@ -5,3 +5,7 @@ pydantic>=2.7
 pydantic-settings>=2.3
 beautifulsoup4>=4.12
 markdownify>=0.13
+fastembed>=0.4
+asyncpg>=0.29
+pgvector>=0.3
+anthropic>=0.40

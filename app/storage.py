@@ -1,129 +1,269 @@
-"""Disk-backed persistence for jobs and scraped pages.
+"""Postgres-backed persistence for jobs and scraped pages.
 
-Layout per job:
+Two tables:
 
-    data/{job_id}/
-        job.json              # JobState — survives restarts, keeps API stateless
-        index.json            # list[PageSummary] (metadata only)
-        pages/
-            001-home.md       # one markdown file per page
+    jobs   one row per crawl — JobState, keyed by job_id
+    pages  one row per scraped page, keyed by (job_id, page_index)
 
-Deliberately filesystem-based so multiple uvicorn workers on one box share
-state with no in-memory registry. The loaders/writers are the only place that
-knows the layout, so moving to Postgres + object storage later is contained.
+Living in Postgres (rather than on local disk) means multiple uvicorn
+workers or container replicas share state with no shared volume, and the
+scraping->persisted transition can be claimed atomically across all of them
+(see `mark_persisting`) instead of relying on an in-process lock.
 """
 
-import json
-import re
-from datetime import datetime, timezone
-from pathlib import Path
-from typing import Optional
+import asyncpg
 
-from .config import settings
+from . import db
 from .models import JobPages, JobState, Page, PageSummary, Section
 
+_schema_ready = False
 
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS jobs (
+  job_id             TEXT PRIMARY KEY,
+  url                TEXT NOT NULL,
+  tenant_id          TEXT NOT NULL,
+  status             TEXT NOT NULL,
+  completed_pages    INT NOT NULL DEFAULT 0,
+  total_pages        INT NOT NULL DEFAULT 0,
+  error              TEXT,
+  persisted          BOOLEAN NOT NULL DEFAULT false,
+  ingest_status      TEXT NOT NULL DEFAULT 'not_started',
+  ingested_chunks    INT NOT NULL DEFAULT 0,
+  ingested_questions INT NOT NULL DEFAULT 0,
+  ingest_error       TEXT,
+  created_at         timestamptz NOT NULL DEFAULT now(),
+  updated_at         timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS jobs_tenant_idx ON jobs (tenant_id);
+CREATE INDEX IF NOT EXISTS jobs_ingest_status_idx ON jobs (ingest_status);
+
+CREATE TABLE IF NOT EXISTS pages (
+  job_id         TEXT NOT NULL REFERENCES jobs (job_id) ON DELETE CASCADE,
+  page_index     INT NOT NULL,
+  url            TEXT NOT NULL,
+  title          TEXT,
+  description    TEXT,
+  markdown       TEXT NOT NULL,
+  chars          INT NOT NULL,
+  section_count  INT NOT NULL DEFAULT 0,
+  sections       JSONB,
+  created_at     timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (job_id, page_index)
+);
+
+CREATE INDEX IF NOT EXISTS pages_job_idx ON pages (job_id);
+"""
 
 
-def _job_dir(job_id: str) -> Path:
-    return settings.data_dir / job_id
+async def _pool() -> asyncpg.Pool:
+    global _schema_ready
+    pool = await db.get_pool()
+    if not _schema_ready:
+        async with pool.acquire() as conn:
+            await conn.execute(_SCHEMA_SQL)
+        _schema_ready = True
+    return pool
 
 
-def _slug(url: str, fallback: str) -> str:
-    tail = url.rstrip("/").split("/")[-1] or fallback
-    slug = re.sub(r"[^a-zA-Z0-9]+", "-", tail).strip("-").lower()
-    return (slug or fallback)[:60]
-
-
-def create_job(job_id: str, url: str) -> JobState:
-    _job_dir(job_id).mkdir(parents=True, exist_ok=True)
-    state = JobState(
-        job_id=job_id,
-        url=url,
-        status="scraping",
-        created_at=_now(),
-        updated_at=_now(),
+def _row_to_job(row: asyncpg.Record) -> JobState:
+    return JobState(
+        job_id=row["job_id"],
+        url=row["url"],
+        tenant_id=row["tenant_id"],
+        status=row["status"],
+        completed_pages=row["completed_pages"],
+        total_pages=row["total_pages"],
+        error=row["error"],
+        persisted=row["persisted"],
+        ingest_status=row["ingest_status"],
+        ingested_chunks=row["ingested_chunks"],
+        ingested_questions=row["ingested_questions"],
+        ingest_error=row["ingest_error"],
+        created_at=row["created_at"].isoformat() if row["created_at"] else None,
+        updated_at=row["updated_at"].isoformat() if row["updated_at"] else None,
     )
-    save_job(state)
-    return state
 
 
-def save_job(state: JobState) -> None:
-    state.updated_at = _now()
-    path = _job_dir(state.job_id) / "job.json"
-    path.write_text(state.model_dump_json(indent=2), encoding="utf-8")
+async def create_job(job_id: str, url: str, tenant_id: str) -> JobState:
+    pool = await _pool()
+    row = await pool.fetchrow(
+        """
+        INSERT INTO jobs (job_id, url, tenant_id, status)
+        VALUES ($1, $2, $3, 'scraping')
+        RETURNING *
+        """,
+        job_id,
+        url,
+        tenant_id,
+    )
+    return _row_to_job(row)
 
 
-def load_job(job_id: str) -> Optional[JobState]:
-    path = _job_dir(job_id) / "job.json"
-    if not path.exists():
-        return None
-    return JobState.model_validate_json(path.read_text(encoding="utf-8"))
+async def save_job(state: JobState) -> None:
+    pool = await _pool()
+    row = await pool.fetchrow(
+        """
+        UPDATE jobs SET
+          status = $2, completed_pages = $3, total_pages = $4, error = $5,
+          persisted = $6, ingest_status = $7, ingested_chunks = $8,
+          ingested_questions = $9, ingest_error = $10, updated_at = now()
+        WHERE job_id = $1
+        RETURNING updated_at
+        """,
+        state.job_id,
+        state.status,
+        state.completed_pages,
+        state.total_pages,
+        state.error,
+        state.persisted,
+        state.ingest_status,
+        state.ingested_chunks,
+        state.ingested_questions,
+        state.ingest_error,
+    )
+    if row:
+        state.updated_at = row["updated_at"].isoformat()
 
 
-def persist_pages(job_id: str, pages: list[Page]) -> list[PageSummary]:
-    """Write markdown files + index.json for a completed crawl. Idempotent."""
-    pages_dir = _job_dir(job_id) / "pages"
-    pages_dir.mkdir(parents=True, exist_ok=True)
+async def load_job(job_id: str) -> JobState | None:
+    pool = await _pool()
+    row = await pool.fetchrow("SELECT * FROM jobs WHERE job_id = $1", job_id)
+    return _row_to_job(row) if row else None
 
+
+async def reconcile_interrupted_jobs() -> int:
+    """Startup-only. A process restart mid-ingest leaves rows stuck at
+    ingest_status='ingesting' with no background task left to finish them.
+    Flags those so callers see a real status instead of a silent hang;
+    POST /ingest/{job_id} retries. Returns the number of rows affected.
+    """
+    pool = await _pool()
+    result = await pool.execute(
+        """
+        UPDATE jobs SET ingest_status = 'ingest_failed',
+                        ingest_error = 'interrupted by server restart',
+                        updated_at = now()
+        WHERE ingest_status = 'ingesting'
+        """
+    )
+    return int(result.split()[-1])
+
+
+async def mark_persisting(job_id: str, total_pages: int) -> JobState | None:
+    """Atomically claim the scraping->persisted transition for a job.
+
+    Returns the claimed row if this call won the race, or None if another
+    caller — in this process or a different replica — already claimed it.
+    This is the cross-replica-safe replacement for an in-process lock: the
+    UPDATE's WHERE clause is only satisfied for the one caller that runs it
+    first, no matter how many processes are polling the same job_id.
+    """
+    pool = await _pool()
+    row = await pool.fetchrow(
+        """
+        UPDATE jobs SET persisted = true, status = 'completed',
+                        total_pages = $2, updated_at = now()
+        WHERE job_id = $1 AND persisted = false
+        RETURNING *
+        """,
+        job_id,
+        total_pages,
+    )
+    return _row_to_job(row) if row else None
+
+
+async def revert_persisting(job_id: str, error: str) -> None:
+    """Roll back a claim if persisting pages failed after mark_persisting
+    succeeded, so the next poll retries instead of getting stuck at
+    persisted=true with no pages ever written.
+    """
+    pool = await _pool()
+    await pool.execute(
+        "UPDATE jobs SET persisted = false, error = $2, updated_at = now() WHERE job_id = $1",
+        job_id,
+        error,
+    )
+
+
+async def persist_pages(job_id: str, pages: list[Page]) -> list[PageSummary]:
+    """Replace all pages for a job. Idempotent — DELETE + INSERT in one
+    transaction, so re-running with a different page set never leaves stale
+    rows from a previous crawl of the same job behind.
+    """
+    pool = await _pool()
+    rows = []
     summaries: list[PageSummary] = []
     for i, page in enumerate(pages, start=1):
-        stem = f"{i:03d}-{_slug(page.url, f'page-{i}')}"
-        filename = f"{stem}.md"
-        front_matter = (
-            f"---\nurl: {page.url}\ntitle: {page.title or ''}\n"
-            f"description: {page.description or ''}\n---\n\n"
+        chars = len(page.markdown)
+        sections_payload = (
+            [s.model_dump() for s in page.sections] if page.sections else None
         )
-        (pages_dir / filename).write_text(front_matter + page.markdown, encoding="utf-8")
-
-        if page.sections:
-            (pages_dir / f"{stem}.sections.json").write_text(
-                json.dumps(
-                    [s.model_dump() for s in page.sections], indent=2, ensure_ascii=False
-                ),
-                encoding="utf-8",
+        rows.append(
+            (
+                job_id,
+                i,
+                page.url,
+                page.title,
+                page.description,
+                page.markdown,
+                chars,
+                len(page.sections),
+                sections_payload,
             )
-
+        )
         summaries.append(
             PageSummary(
                 url=page.url,
                 title=page.title,
-                chars=len(page.markdown),
-                file=f"pages/{filename}",
+                chars=chars,
                 section_count=len(page.sections),
             )
         )
 
-    index_path = _job_dir(job_id) / "index.json"
-    index_path.write_text(
-        json.dumps([s.model_dump(exclude={"markdown"}) for s in summaries], indent=2),
-        encoding="utf-8",
-    )
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute("DELETE FROM pages WHERE job_id = $1", job_id)
+            if rows:
+                await conn.executemany(
+                    """
+                    INSERT INTO pages (job_id, page_index, url, title, description,
+                                       markdown, chars, section_count, sections)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                    """,
+                    rows,
+                )
     return summaries
 
 
-def load_pages(job_id: str, include_content: bool = False) -> Optional[JobPages]:
-    job = load_job(job_id)
-    if job is None:
+async def load_pages(job_id: str, include_content: bool = False) -> JobPages | None:
+    pool = await _pool()
+    job_row = await pool.fetchrow("SELECT url FROM jobs WHERE job_id = $1", job_id)
+    if job_row is None:
         return None
-    index_path = _job_dir(job_id) / "index.json"
-    if not index_path.exists():
-        return JobPages(job_id=job_id, url=job.url, page_count=0, pages=[])
 
-    raw = json.loads(index_path.read_text(encoding="utf-8"))
-    summaries = [PageSummary(**item) for item in raw]
+    cols = "url, title, chars, section_count"
     if include_content:
-        for s in summaries:
-            file_path = _job_dir(job_id) / s.file
-            if file_path.exists():
-                s.markdown = file_path.read_text(encoding="utf-8")
-            sections_path = file_path.with_suffix(".sections.json")
-            if sections_path.exists():
-                raw_sections = json.loads(sections_path.read_text(encoding="utf-8"))
-                s.sections = [Section(**item) for item in raw_sections]
+        cols += ", markdown, sections"
+    rows = await pool.fetch(
+        f"SELECT {cols} FROM pages WHERE job_id = $1 ORDER BY page_index", job_id
+    )
+
+    summaries = []
+    for row in rows:
+        summary = PageSummary(
+            url=row["url"],
+            title=row["title"],
+            chars=row["chars"],
+            section_count=row["section_count"],
+        )
+        if include_content:
+            summary.markdown = row["markdown"]
+            if row["sections"]:
+                summary.sections = [Section(**item) for item in row["sections"]]
+        summaries.append(summary)
 
     return JobPages(
-        job_id=job_id, url=job.url, page_count=len(summaries), pages=summaries
+        job_id=job_id, url=job_row["url"], page_count=len(summaries), pages=summaries
     )
