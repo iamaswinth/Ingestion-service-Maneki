@@ -1,0 +1,7 @@
+{
+  "dependencies": ["."],
+  "graphs": {
+    "sales_script": "app/salescript/graph.py:graph"
+  },
+  "env": ".env"
+}

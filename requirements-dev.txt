@@ -1,0 +1,10 @@
+# Optional, local-dev-only tooling. Not needed in production — the graph
+# runs in-process via app/salescript/graph.py, invoked from FastAPI
+# BackgroundTasks (see app/salescript/service.py).
+#
+# Install this to use `langgraph dev`, which spins up a local server + opens
+# LangGraph Studio in the browser for visually stepping through/replaying
+# runs of the sales-script graph (see langgraph.json) while iterating on
+# prompts in app/salescript/prompts.py.
+-r requirements.txt
+langgraph-cli[inmem]>=0.1

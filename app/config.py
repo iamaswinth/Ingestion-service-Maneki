@@ -1,3 +1,5 @@
+import os
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -63,5 +65,30 @@ class Settings(BaseSettings):
     hybrid_candidate_multiplier: int = 8
     hybrid_candidate_floor: int = 50
 
+    # --- Sales script generation (app/salescript/) ---
+    # An explicit, user-triggered action (unlike doc2query's silent fail-open)
+    # so disabling it should surface as an error, not a no-op.
+    sales_script_enabled: bool = True
+    sales_script_extract_model: str = "claude-haiku-4-5"  # extract_facts tier
+    sales_script_model: str = "claude-sonnet-5"  # derive_icp/draft/critique tier
+    sales_script_max_revisions: int = 2
+    sales_script_max_page_chars: int = 8000
+    sales_script_page_batch_size: int = 1
+    sales_script_max_concurrent_extractions: int = 4
+
+    # LangSmith tracing for the sales-script graph. Read as our own settings
+    # (not left to pydantic-settings' env_file loading, which never mutates
+    # os.environ) and forwarded below so the langsmith/langgraph libraries —
+    # which read these via os.environ directly — see them regardless of
+    # whether the process already had them exported.
+    langchain_tracing_v2: bool = False
+    langchain_api_key: str = ""
+    langchain_project: str = "firecrawl-sales-script"
+
 
 settings = Settings()
+
+if settings.langchain_tracing_v2 and settings.langchain_api_key:
+    os.environ["LANGCHAIN_TRACING_V2"] = "true"
+    os.environ["LANGCHAIN_API_KEY"] = settings.langchain_api_key
+    os.environ["LANGCHAIN_PROJECT"] = settings.langchain_project

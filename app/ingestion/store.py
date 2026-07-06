@@ -96,25 +96,8 @@ async def get_pool() -> asyncpg.Pool:
     return pool
 
 
-async def delete_site_chunks(tenant_id: str, site_url: str) -> None:
-    pool = await get_pool()
-    await pool.execute(
-        "DELETE FROM chunks WHERE tenant_id = $1 AND site_url = $2", tenant_id, site_url
-    )
-
-
-async def replace_site_chunks(
-    tenant_id: str, site_url: str, chunks: list[Chunk], embeddings: list[list[float]]
-) -> int:
-    """Atomically swap all of a site's chunks for a fresh set from one crawl.
-
-    Deletes by (tenant_id, site_url) rather than job_id so that pages/sections
-    removed from the live site don't leave stale, unreachable rows behind from
-    a previous crawl of the same site. Delete + insert share one transaction
-    so a concurrent /query never sees the site's chunks disappear.
-    """
-    pool = await get_pool()
-    rows = [
+def _chunk_rows(chunks: list[Chunk], embeddings: list[list[float]]) -> list[tuple]:
+    return [
         (
             c.chunk_id,
             c.tenant_id,
@@ -137,26 +120,82 @@ async def replace_site_chunks(
         )
         for c, emb in zip(chunks, embeddings)
     ]
+
+
+async def _insert_chunk_rows(conn: asyncpg.Connection, rows: list[tuple]) -> None:
+    if rows:
+        await conn.executemany(
+            """
+            INSERT INTO chunks (
+                chunk_id, tenant_id, job_id, site_url, page_url,
+                section_id, parent_section_id, anchor_type, navigation,
+                title, content_type, chunk_index, text, embedding,
+                kind, parent_chunk_id, question, embedding_text
+            )
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+            """,
+            rows,
+        )
+
+
+async def delete_site_chunks(tenant_id: str, site_url: str) -> None:
+    """Wipes a failed/emptied crawl's chunks. Excludes kind='sales_script' so a
+    reviewed, approved sales script survives a scrape that later 404s or comes
+    back with zero pages."""
+    pool = await get_pool()
+    await pool.execute(
+        "DELETE FROM chunks WHERE tenant_id = $1 AND site_url = $2 AND kind != 'sales_script'",
+        tenant_id,
+        site_url,
+    )
+
+
+async def replace_site_chunks(
+    tenant_id: str, site_url: str, chunks: list[Chunk], embeddings: list[list[float]]
+) -> int:
+    """Atomically swap all of a site's content/question chunks for a fresh set
+    from one crawl.
+
+    Deletes by (tenant_id, site_url) rather than job_id so that pages/sections
+    removed from the live site don't leave stale, unreachable rows behind from
+    a previous crawl of the same site. Delete + insert share one transaction
+    so a concurrent /query never sees the site's chunks disappear.
+
+    Excludes kind='sales_script': those rows are replaced only via
+    replace_site_script_chunks (on approval), so an ordinary re-ingest never
+    wipes a reviewed, approved sales script out from under the voice agent.
+    """
+    pool = await get_pool()
+    rows = _chunk_rows(chunks, embeddings)
     async with pool.acquire() as conn:
         async with conn.transaction():
             await conn.execute(
-                "DELETE FROM chunks WHERE tenant_id = $1 AND site_url = $2",
+                "DELETE FROM chunks WHERE tenant_id = $1 AND site_url = $2 AND kind != 'sales_script'",
                 tenant_id,
                 site_url,
             )
-            if rows:
-                await conn.executemany(
-                    """
-                    INSERT INTO chunks (
-                        chunk_id, tenant_id, job_id, site_url, page_url,
-                        section_id, parent_section_id, anchor_type, navigation,
-                        title, content_type, chunk_index, text, embedding,
-                        kind, parent_chunk_id, question, embedding_text
-                    )
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
-                    """,
-                    rows,
-                )
+            await _insert_chunk_rows(conn, rows)
+    return len(rows)
+
+
+async def replace_site_script_chunks(
+    tenant_id: str, site_url: str, chunks: list[Chunk], embeddings: list[list[float]]
+) -> int:
+    """Swap only a site's kind='sales_script' chunks, leaving content/question
+    rows from the normal ingest path untouched. Called on sales-script
+    approval, mirroring replace_site_chunks's delete+insert-in-one-transaction
+    shape.
+    """
+    pool = await get_pool()
+    rows = _chunk_rows(chunks, embeddings)
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                "DELETE FROM chunks WHERE tenant_id = $1 AND site_url = $2 AND kind = 'sales_script'",
+                tenant_id,
+                site_url,
+            )
+            await _insert_chunk_rows(conn, rows)
     return len(rows)
 
 

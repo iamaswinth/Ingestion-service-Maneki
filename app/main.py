@@ -1,17 +1,21 @@
 """Scraping + ingestion pipeline API.
 
 Flow:
-    POST /scrape                -> start a crawl, return job_id
-    GET  /scrape/{job_id}       -> live status; persists pages once crawl completes,
-                                    then auto-triggers ingestion in the background
-    GET  /scrape/{job_id}/pages -> the persisted page index
-    POST /ingest/{job_id}       -> (re-)run ingestion for a job synchronously
-    POST /query                 -> hybrid (vector + lexical) search over a tenant's chunks
-    GET  /map?url=              -> preview URLs before committing to a crawl
-    GET  /health                -> Firecrawl + database reachability
+    POST /scrape                       -> start a crawl, return job_id
+    GET  /scrape/{job_id}               -> live status; persists pages once crawl completes,
+                                            then auto-triggers ingestion in the background
+    GET  /scrape/{job_id}/pages         -> the persisted page index
+    POST /ingest/{job_id}               -> (re-)run ingestion for a job synchronously
+    POST /sales-script/{job_id}         -> kick off sales-script generation for that job's site
+    GET  /sales-script/{tenant_id}      -> current sales script (any status) for a tenant
+    POST /sales-script/{tenant_id}/approve -> approve a pending_review script; indexes it into chunks
+    POST /query                         -> hybrid (vector + lexical) search over a tenant's chunks
+    GET  /map?url=                      -> preview URLs before committing to a crawl
+    GET  /health                        -> Firecrawl + database reachability
 """
 
 import asyncio
+from typing import Optional
 
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
 
@@ -28,8 +32,13 @@ from .models import (
     MapResult,
     QueryRequest,
     QueryResponse,
+    SalesScriptApproveResponse,
+    SalesScriptGenerateResponse,
+    SalesScriptRecord,
     ScrapeRequest,
 )
+from .salescript import service as salescript_service
+from .salescript import store as salescript_store
 
 app = FastAPI(
     title="Firecrawl Scraping + Ingestion Pipeline",
@@ -204,6 +213,82 @@ async def trigger_ingest(job_id: str) -> IngestResult:
     await storage.save_job(state)
     return IngestResult(
         job_id=job_id, chunk_count=chunk_count, question_count=question_count
+    )
+
+
+@app.post("/sales-script/{job_id}", response_model=SalesScriptGenerateResponse, status_code=202)
+async def start_sales_script(
+    job_id: str, background_tasks: BackgroundTasks
+) -> SalesScriptGenerateResponse:
+    """Kick off sales-script generation for the site this job scraped.
+
+    Only requires the crawl to be persisted (not ingested) — fact extraction
+    reads pages directly, not the chunks table. Keyed by (tenant_id, site_url)
+    like the chunks table, so this can be re-triggered for the same site
+    across different crawl jobs; job_id is stored for provenance only.
+    """
+    if not settings.sales_script_enabled:
+        raise HTTPException(status_code=403, detail="Sales script generation is disabled")
+
+    state = await storage.load_job(job_id)
+    if state is None:
+        raise HTTPException(status_code=404, detail="Unknown job_id")
+    if not state.persisted:
+        raise HTTPException(status_code=409, detail="Crawl has not completed/persisted yet")
+
+    claimed = await salescript_store.claim_generation(state.tenant_id, state.url, job_id)
+    if claimed is None:
+        raise HTTPException(
+            status_code=409,
+            detail="Sales script generation already in progress for this site",
+        )
+
+    background_tasks.add_task(
+        salescript_service.run_generation, state.tenant_id, state.url, job_id
+    )
+    return SalesScriptGenerateResponse(
+        tenant_id=state.tenant_id, site_url=state.url, job_id=job_id, status="generating"
+    )
+
+
+@app.get("/sales-script/{tenant_id}", response_model=SalesScriptRecord)
+async def get_sales_script(
+    tenant_id: str,
+    site_url: Optional[str] = Query(
+        default=None, description="Omit to get the tenant's most-recently-updated script"
+    ),
+) -> SalesScriptRecord:
+    """Returns the record regardless of status — a human reviewer needs
+    pending_review + critique to decide; a voice-gateway consumer checks
+    status == "ready" itself before using it as call context."""
+    record = await salescript_store.load_current(tenant_id, site_url)
+    if record is None:
+        raise HTTPException(status_code=404, detail="No sales script found for this tenant")
+    return record
+
+
+@app.post("/sales-script/{tenant_id}/approve", response_model=SalesScriptApproveResponse)
+async def approve_sales_script(
+    tenant_id: str,
+    site_url: Optional[str] = Query(
+        default=None, description="Omit to approve the tenant's most-recently-updated script"
+    ),
+) -> SalesScriptApproveResponse:
+    """Flips a pending_review script to ready and indexes its sections into
+    the chunks table (kind="sales_script") so /query can surface them."""
+    try:
+        record, indexed = await salescript_service.approve_and_index(tenant_id, site_url)
+    except salescript_service.SalesScriptNotFound:
+        raise HTTPException(status_code=404, detail="No sales script found for this tenant")
+    except salescript_service.SalesScriptWrongState as exc:
+        raise HTTPException(
+            status_code=409, detail=f"Sales script is not pending review (status={exc})"
+        )
+    return SalesScriptApproveResponse(
+        tenant_id=tenant_id,
+        site_url=record.site_url,
+        status=record.status,
+        indexed_chunks=indexed,
     )
 
 

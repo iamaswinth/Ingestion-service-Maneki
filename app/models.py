@@ -1,6 +1,6 @@
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 
 # Our normalized job status. Firecrawl reports "scraping"/"completed"/"failed"/
 # "cancelled"; we map anything else onto these.
@@ -10,9 +10,17 @@ JobStatus = Literal["scraping", "completed", "failed", "cancelled"]
 # separately from crawl status since it runs after the crawl completes.
 IngestStatus = Literal["not_started", "ingesting", "ingested", "ingest_failed"]
 
-ContentType = Literal["hero", "feature", "pricing", "faq", "testimonial", "generic"]
+ContentType = Literal[
+    "hero", "feature", "pricing", "faq", "testimonial", "generic", "sales_script"
+]
 
 AnchorType = Literal["id", "text", "page"]
+
+# Sales script generation (app/salescript/) lifecycle: a LangGraph run lands in
+# pending_review; a separate human approval flips it to ready.
+SalesScriptStatus = Literal[
+    "not_started", "generating", "pending_review", "ready", "failed"
+]
 
 
 class ScrapeRequest(BaseModel):
@@ -143,7 +151,7 @@ class Chunk(BaseModel):
     chunk_index: int = 0
     text: str
     embedding_text: str
-    kind: Literal["content", "question"] = "content"
+    kind: Literal["content", "question", "sales_script"] = "content"
     parent_chunk_id: Optional[str] = None
     question: Optional[str] = None
 
@@ -187,3 +195,83 @@ class QueryHit(BaseModel):
 
 class QueryResponse(BaseModel):
     hits: list[QueryHit]
+
+
+# --- Sales script generation (app/salescript/) ---
+# `extra="forbid"` on every model below is required so `.model_json_schema()`
+# sets `additionalProperties: false` at every nesting level, which Anthropic's
+# structured-output (json_schema) mode requires.
+
+
+class ValueProp(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    pain_point: str
+    value_prop: str
+
+
+class ObjectionQA(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    objection: str
+    response: str
+
+
+class SalesScript(BaseModel):
+    """The structured sales script a completed graph run produces — the unit
+    a human reviews/approves, and that gets split into retrievable chunks
+    (app/salescript/chunker.py) once approved."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    opening_hook: str
+    discovery_questions: list[str]
+    value_props: list[ValueProp]
+    objection_handling: list[ObjectionQA]
+    pricing_talk_track: str
+    competitive_positioning: str
+    closing_cta: str
+
+
+class IcpProfile(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    ideal_customer: str
+    top_pain_points: list[str]
+    buying_triggers: list[str] = []
+
+
+class SalesScriptCritique(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    passed: bool
+    issues: list[str] = []
+
+
+class SalesScriptRecord(BaseModel):
+    """One row of the sales_scripts table, keyed by (tenant_id, site_url)."""
+
+    tenant_id: str
+    site_url: str
+    job_id: str
+    status: SalesScriptStatus
+    script: Optional[SalesScript] = None
+    critique: Optional[SalesScriptCritique] = None
+    revision_count: int = 0
+    error: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class SalesScriptGenerateResponse(BaseModel):
+    tenant_id: str
+    site_url: str
+    job_id: str
+    status: SalesScriptStatus
+
+
+class SalesScriptApproveResponse(BaseModel):
+    tenant_id: str
+    site_url: str
+    status: SalesScriptStatus
+    indexed_chunks: int

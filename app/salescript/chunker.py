@@ -1,0 +1,103 @@
+"""Turns an approved SalesScript into retrievable Chunk rows (kind="sales_script").
+
+Mirrors app/ingestion/chunker.py's per-item granularity (doc2query splits one
+question per row; here value_props/objection_handling split one entry per
+row) so /query can surface the single most relevant talking point rather than
+the whole script at once.
+
+There's no real on-page anchor for synthesized content, so these chunks reuse
+the *existing* anchor_type="page" meaning (the bare site_url) rather than
+adding a new AnchorType value.
+"""
+
+import hashlib
+
+from ..models import Chunk, SalesScript
+
+
+def _chunk_id(tenant_id: str, site_url: str, section_key: str, idx: int) -> str:
+    raw = f"{tenant_id}|{site_url}|sales_script|{section_key}|{idx}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _make_chunk(
+    *,
+    tenant_id: str,
+    job_id: str,
+    site_url: str,
+    section_key: str,
+    idx: int,
+    title: str,
+    text: str,
+    chunk_index: int,
+) -> Chunk:
+    return Chunk(
+        chunk_id=_chunk_id(tenant_id, site_url, section_key, idx),
+        tenant_id=tenant_id,
+        job_id=job_id,
+        site_url=site_url,
+        page_url=site_url,
+        section_id=f"sales_script:{section_key}:{idx}",
+        parent_section_id=None,
+        anchor_type="page",
+        navigation=site_url,
+        title=title,
+        content_type="sales_script",
+        chunk_index=chunk_index,
+        text=text,
+        embedding_text=f"Sales script — {title}: {text}",
+        kind="sales_script",
+        parent_chunk_id=None,
+        question=None,
+    )
+
+
+def sales_script_to_chunks(
+    script: SalesScript, *, tenant_id: str, job_id: str, site_url: str
+) -> list[Chunk]:
+    chunks: list[Chunk] = []
+    i = 0
+
+    def add(section_key: str, idx: int, title: str, text: str) -> None:
+        nonlocal i
+        if text.strip():
+            chunks.append(
+                _make_chunk(
+                    tenant_id=tenant_id,
+                    job_id=job_id,
+                    site_url=site_url,
+                    section_key=section_key,
+                    idx=idx,
+                    title=title,
+                    text=text,
+                    chunk_index=i,
+                )
+            )
+            i += 1
+
+    add("opening_hook", 0, "Opening Hook", script.opening_hook)
+    add(
+        "discovery_questions",
+        0,
+        "Discovery Questions",
+        "\n".join(f"- {q}" for q in script.discovery_questions),
+    )
+    for idx, vp in enumerate(script.value_props):
+        add(
+            "value_prop",
+            idx,
+            f"Value Prop: {vp.pain_point}",
+            vp.value_prop,
+        )
+    for idx, oq in enumerate(script.objection_handling):
+        add(
+            "objection",
+            idx,
+            f"Objection: {oq.objection}",
+            f'If the prospect says: "{oq.objection}" — respond: {oq.response}',
+        )
+    add("pricing_talk_track", 0, "Pricing", script.pricing_talk_track)
+    add("competitive_positioning", 0, "Competitive Positioning", script.competitive_positioning)
+    add("closing_cta", 0, "Closing", script.closing_cta)
+
+    return chunks

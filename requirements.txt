@@ -9,3 +9,5 @@ fastembed>=0.4
 asyncpg>=0.29
 pgvector>=0.3
 anthropic>=0.40
+langgraph>=0.2
+langsmith>=0.1
