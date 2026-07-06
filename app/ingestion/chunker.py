@@ -143,10 +143,18 @@ def _walk_sections(sections: list[Section], parent_id: Optional[str] = None):
 
 
 def _page_has_usable_sections(page: Page) -> bool:
+    """Walks the *whole* section tree, not just the top level — page builders
+    (Framer, Next.js, ...) routinely wrap everything in one generic top-level
+    container (id="main"/"root"/"__next") while giving real, well-named ids
+    to the sections nested underneath it (e.g. id="features"). Checking only
+    page.sections would see that single generic wrapper, conclude there's
+    nothing usable, and fall back to flat-markdown chunking for the entire
+    page — discarding perfectly good nested section ids in the process.
+    """
     if not page.sections:
         return False
     total_chars = max(len(page.markdown), 1)
-    for sec in page.sections:
+    for sec, _parent_id in _walk_sections(page.sections):
         if _is_generic_id(sec.id):
             continue
         if sec.chars <= _DOMINANCE_THRESHOLD * total_chars:
@@ -200,7 +208,16 @@ def _chunks_from_sections(page: Page, job_id: str, tenant_id: str, site_url: str
             settings.chunk_max_chars,
             settings.chunk_overlap_chars,
         )
-        for idx, piece in enumerate(pieces):
+        # _split_long_text's break-point search can land close to `start`,
+        # producing a tiny leftover piece (seen in the wild as single-word/
+        # single-character fragments from pages with lots of short
+        # animation-reveal "paragraphs") — apply the same min-length floor
+        # _chunks_from_flat_markdown already applies to its pieces, so a long
+        # section doesn't slip a batch of near-empty chunks past chunk_min_chars.
+        idx = 0
+        for piece in pieces:
+            if len(piece) < settings.chunk_min_chars:
+                continue
             chunks.append(
                 _build_chunk(
                     tenant_id=tenant_id,
@@ -214,6 +231,7 @@ def _chunks_from_sections(page: Page, job_id: str, tenant_id: str, site_url: str
                     idx=idx,
                 )
             )
+            idx += 1
     return chunks
 
 
