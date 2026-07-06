@@ -160,6 +160,11 @@ class QueryRequest(BaseModel):
     top_k: int = Field(default=5, ge=1, le=20)
     site_url: Optional[str] = None
     page_url: Optional[str] = None
+    # None => use settings.hybrid_search_enabled; explicit True/False overrides
+    # per request, for A/B eval of hybrid vs. vector-only.
+    hybrid: Optional[bool] = None
+    # When true, populate QueryHit.vector_score/lexical_score for tuning.
+    debug: bool = False
 
 
 class QueryHit(BaseModel):
@@ -174,6 +179,10 @@ class QueryHit(BaseModel):
     # When a synthetic question vector produced this hit, the question that
     # matched — useful for debugging retrieval quality.
     matched_question: Optional[str] = None
+    # Per-leg scores, populated only when QueryRequest.debug=True and the
+    # hybrid path ran (cosine similarity / ts_rank_cd respectively).
+    vector_score: Optional[float] = None
+    lexical_score: Optional[float] = None
 
 
 class QueryResponse(BaseModel):

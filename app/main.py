@@ -6,7 +6,7 @@ Flow:
                                     then auto-triggers ingestion in the background
     GET  /scrape/{job_id}/pages -> the persisted page index
     POST /ingest/{job_id}       -> (re-)run ingestion for a job synchronously
-    POST /query                 -> vector search over a tenant's ingested chunks
+    POST /query                 -> hybrid (vector + lexical) search over a tenant's chunks
     GET  /map?url=              -> preview URLs before committing to a crawl
     GET  /health                -> Firecrawl + database reachability
 """
@@ -213,9 +213,12 @@ async def query(req: QueryRequest) -> QueryResponse:
     hits = await ingestion_store.search(
         tenant_id=req.tenant_id,
         embedding=embedding,
+        question=req.question,
         top_k=req.top_k,
         site_url=req.site_url,
         page_url=req.page_url,
+        hybrid=req.hybrid,
+        debug=req.debug,
     )
     return QueryResponse(hits=hits)
 

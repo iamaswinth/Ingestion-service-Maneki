@@ -54,5 +54,14 @@ class Settings(BaseSettings):
     # How many chunks to pack into one LLM request.
     question_gen_batch_size: int = 12
 
+    # --- Hybrid retrieval: dense vector + Postgres full-text, fused via RRF ---
+    hybrid_search_enabled: bool = True
+    hybrid_rrf_k: int = 60
+    hybrid_vector_weight: float = 1.0
+    hybrid_lexical_weight: float = 1.0
+    # Mirrors the vector leg's existing top_k*8 oversample factor.
+    hybrid_candidate_multiplier: int = 8
+    hybrid_candidate_floor: int = 50
+
 
 settings = Settings()
