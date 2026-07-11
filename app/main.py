@@ -17,9 +17,10 @@ Flow:
 import asyncio
 from typing import Optional
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query
 
 from . import db, scraper, storage
+from .auth import require_internal_token
 from .config import settings
 from .ingestion import service as ingestion_service
 from .ingestion import store as ingestion_store
@@ -100,7 +101,12 @@ async def health() -> dict:
     }
 
 
-@app.post("/scrape", response_model=JobCreated, status_code=202)
+@app.post(
+    "/scrape",
+    response_model=JobCreated,
+    status_code=202,
+    dependencies=[Depends(require_internal_token)],
+)
 async def start_scrape(req: ScrapeRequest) -> JobCreated:
     limit = min(req.limit or settings.default_crawl_limit, settings.max_crawl_limit)
     wait_for = min(
@@ -123,7 +129,9 @@ async def start_scrape(req: ScrapeRequest) -> JobCreated:
     return JobCreated(job_id=job_id, url=url, tenant_id=req.tenant_id)
 
 
-@app.get("/scrape/{job_id}", response_model=JobState)
+@app.get(
+    "/scrape/{job_id}", response_model=JobState, dependencies=[Depends(require_internal_token)]
+)
 async def get_scrape(job_id: str, background_tasks: BackgroundTasks) -> JobState:
     state = await storage.load_job(job_id)
     if state is None:
@@ -172,7 +180,11 @@ async def get_scrape(job_id: str, background_tasks: BackgroundTasks) -> JobState
     return claimed
 
 
-@app.get("/scrape/{job_id}/pages", response_model=JobPages)
+@app.get(
+    "/scrape/{job_id}/pages",
+    response_model=JobPages,
+    dependencies=[Depends(require_internal_token)],
+)
 async def get_scrape_pages(
     job_id: str,
     include_content: bool = Query(
@@ -185,7 +197,9 @@ async def get_scrape_pages(
     return pages
 
 
-@app.post("/ingest/{job_id}", response_model=IngestResult)
+@app.post(
+    "/ingest/{job_id}", response_model=IngestResult, dependencies=[Depends(require_internal_token)]
+)
 async def trigger_ingest(job_id: str) -> IngestResult:
     """(Re-)run ingestion for a completed crawl synchronously."""
     state = await storage.load_job(job_id)
@@ -216,7 +230,12 @@ async def trigger_ingest(job_id: str) -> IngestResult:
     )
 
 
-@app.post("/sales-script/{job_id}", response_model=SalesScriptGenerateResponse, status_code=202)
+@app.post(
+    "/sales-script/{job_id}",
+    response_model=SalesScriptGenerateResponse,
+    status_code=202,
+    dependencies=[Depends(require_internal_token)],
+)
 async def start_sales_script(
     job_id: str, background_tasks: BackgroundTasks
 ) -> SalesScriptGenerateResponse:
@@ -251,7 +270,11 @@ async def start_sales_script(
     )
 
 
-@app.get("/sales-script/{tenant_id}", response_model=SalesScriptRecord)
+@app.get(
+    "/sales-script/{tenant_id}",
+    response_model=SalesScriptRecord,
+    dependencies=[Depends(require_internal_token)],
+)
 async def get_sales_script(
     tenant_id: str,
     site_url: Optional[str] = Query(
@@ -267,7 +290,11 @@ async def get_sales_script(
     return record
 
 
-@app.post("/sales-script/{tenant_id}/approve", response_model=SalesScriptApproveResponse)
+@app.post(
+    "/sales-script/{tenant_id}/approve",
+    response_model=SalesScriptApproveResponse,
+    dependencies=[Depends(require_internal_token)],
+)
 async def approve_sales_script(
     tenant_id: str,
     site_url: Optional[str] = Query(
@@ -292,7 +319,9 @@ async def approve_sales_script(
     )
 
 
-@app.post("/query", response_model=QueryResponse)
+@app.post(
+    "/query", response_model=QueryResponse, dependencies=[Depends(require_internal_token)]
+)
 async def query(req: QueryRequest) -> QueryResponse:
     embedding = await asyncio.to_thread(embed_query, req.question)
     hits = await ingestion_store.search(
@@ -308,7 +337,9 @@ async def query(req: QueryRequest) -> QueryResponse:
     return QueryResponse(hits=hits)
 
 
-@app.get("/map", response_model=MapResult)
+@app.get(
+    "/map", response_model=MapResult, dependencies=[Depends(require_internal_token)]
+)
 async def map_url(
     url: str = Query(..., description="Website URL to preview"),
     limit: int = Query(default=50, ge=1, le=500),

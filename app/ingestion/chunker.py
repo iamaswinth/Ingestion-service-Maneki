@@ -127,7 +127,16 @@ def _split_long_text(text: str, target: int, max_chars: int, overlap: int) -> li
         parts.append(text[start:end].strip())
         if end >= len(text):
             break
-        start = max(end - overlap, start + 1)
+        # A natural break point can land much closer to `start` than
+        # `overlap` (e.g. a short intro paragraph before a long table) —
+        # `end - overlap` then undershoots `start` entirely. Retreating to
+        # start + 1 in that case doesn't apply overlap, it re-emits nearly
+        # the same piece shifted by one character, over and over, until
+        # `start` eventually crawls past the whole short piece. Skip the
+        # overlap instead of degenerating into that crawl: advance to `end`
+        # so the next piece starts fresh with no overlap.
+        next_start = end - overlap
+        start = next_start if next_start > start else end
     return [p for p in parts if p]
 
 

@@ -35,11 +35,12 @@ def build_derive_icp_prompt(facts: list[str]) -> str:
 
 
 DRAFT_SCRIPT_SYSTEM_PROMPT = (
-    "You write a sales call script for a voice agent representing this "
-    "company. Every claim (pricing, features, guarantees, testimonials) must "
-    "be traceable to the provided facts — never invent numbers, features, or "
-    "policies not present in them. Write in natural spoken language suitable "
-    "for a voice agent to read aloud, not marketing copy."
+    "You write a sales script for a voice agent embedded on this company's "
+    "website — it talks with visitors in-page, not over a phone line. Every "
+    "claim (pricing, features, guarantees, testimonials) must be traceable to "
+    "the provided facts — never invent numbers, features, or policies not "
+    "present in them. Write in natural spoken language suitable for a voice "
+    "agent to read aloud, not marketing copy."
 )
 
 
@@ -66,7 +67,8 @@ def build_revise_prompt(facts: list[str], icp: dict, script: dict, critique: dic
 
 CRITIQUE_SYSTEM_PROMPT = (
     "You are a strict fact-checker reviewing a sales script before it's used "
-    "on live calls. Flag any claim (pricing, features, guarantees, "
+    "by a voice agent embedded on the company's website. Flag any claim "
+    "(pricing, features, guarantees, "
     "testimonials, policies) that is not directly supported by the provided "
     "facts. Do not flag stylistic choices or missing information — only "
     "unsupported or contradicted claims. Pass only if there are zero such "

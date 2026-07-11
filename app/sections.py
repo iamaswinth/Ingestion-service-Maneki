@@ -64,7 +64,25 @@ def extract_sections(html: str) -> list[Section]:
     except Exception:
         return []
 
-    qualifying = [el for el in soup.find_all(id=True) if _qualifies(el)]
+    # Component-generated markup (Framer, and others) routinely stamps the
+    # same `id` on multiple elements — breakpoint or animation-state variants
+    # of one logical block, one often nested inside the other. Without this
+    # dedup, each duplicate becomes its own Section nested under the last,
+    # and since one is a near-clone of the other, decompose() only partially
+    # separates them: a page can end up with 100+ chained "sections" sharing
+    # one section_id, each markdown just a few characters off from the last.
+    # Keep only the richest (most text) element per distinct id string.
+    by_id: dict[str, object] = {}
+    for el in soup.find_all(id=True):
+        if not _qualifies(el):
+            continue
+        section_id = el.get("id")
+        existing = by_id.get(section_id)
+        if existing is None or len(el.get_text(strip=True)) > len(
+            existing.get_text(strip=True)
+        ):
+            by_id[section_id] = el
+    qualifying = list(by_id.values())
     qset = {id(el) for el in qualifying}
 
     def nearest_qualifying_ancestor(el):

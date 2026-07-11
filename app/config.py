@@ -33,6 +33,12 @@ class Settings(BaseSettings):
         "postgresql://postgres:postgres@localhost:5433/postgres"
     )
 
+    # Shared service-to-service secret required from any internal caller
+    # (the API gateway's forward proxy and the voice runtime both present
+    # it — see app/auth.py). This app has no other auth of its own, so an
+    # unset token means every request is rejected, not "auth is skipped."
+    internal_service_token: str = ""
+
     # Local, free embedding model. 384 dims — must match the `vector(384)`
     # column in app/ingestion/store.py if ever changed.
     embedding_model: str = "BAAI/bge-small-en-v1.5"
