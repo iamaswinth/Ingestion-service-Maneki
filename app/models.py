@@ -215,6 +215,31 @@ class ObjectionQA(BaseModel):
 
     objection: str
     response: str
+    # False when this is a known-important objection category (see the fixed
+    # checklist in DRAFT_SCRIPT_SYSTEM_PROMPT) with no supporting facts on the
+    # site — a disclosed gap for the human reviewer, not a hallucinated answer.
+    covered: bool
+
+
+DiscoveryStage = Literal["situation", "problem", "implication", "need_payoff"]
+
+
+class DiscoveryQuestion(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    stage: DiscoveryStage
+    question: str
+
+
+class ProofPoint(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    claim: str
+    # Free-text description of which objection or value prop this
+    # reinforces, e.g. "value prop: faster onboarding" or "objection:
+    # switching cost" — not an index, so it stays valid even as the model
+    # revises other lists across critique loops.
+    reinforces: str
 
 
 class SalesScript(BaseModel):
@@ -225,12 +250,18 @@ class SalesScript(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     opening_hook: str
-    discovery_questions: list[str]
+    discovery_questions: list[DiscoveryQuestion]
     value_props: list[ValueProp]
     objection_handling: list[ObjectionQA]
+    proof_points: list[ProofPoint]
     pricing_talk_track: str
-    competitive_positioning: str
+    differentiators: str
     closing_cta: str
+    # Short descriptions of what to listen for during discovery (e.g. "team
+    # size", "current tool being replaced", "budget authority", "urgency/
+    # timeline") for a future CRM/lead-capture handoff. Derived from the ICP,
+    # not conversational script content — not indexed into chunks.
+    qualification_signals: list[str]
 
 
 class IcpProfile(BaseModel):

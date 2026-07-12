@@ -80,7 +80,7 @@ def sales_script_to_chunks(
         "discovery_questions",
         0,
         "Discovery Questions",
-        "\n".join(f"- {q}" for q in script.discovery_questions),
+        "\n".join(f"- ({q.stage}) {q.question}" for q in script.discovery_questions),
     )
     for idx, vp in enumerate(script.value_props):
         add(
@@ -90,14 +90,17 @@ def sales_script_to_chunks(
             vp.value_prop,
         )
     for idx, oq in enumerate(script.objection_handling):
-        add(
-            "objection",
-            idx,
-            f"Objection: {oq.objection}",
-            f'If the prospect says: "{oq.objection}" — respond: {oq.response}',
+        text = (
+            f'If the prospect says: "{oq.objection}" — respond: {oq.response}'
+            if oq.covered
+            else f'If the prospect says: "{oq.objection}" — not covered by site '
+            f'content, flagged for owner follow-up: {oq.response}'
         )
+        add("objection", idx, f"Objection: {oq.objection}", text)
+    for idx, pp in enumerate(script.proof_points):
+        add("proof_point", idx, f"Proof Point: {pp.reinforces}", pp.claim)
     add("pricing_talk_track", 0, "Pricing", script.pricing_talk_track)
-    add("competitive_positioning", 0, "Competitive Positioning", script.competitive_positioning)
+    add("differentiators", 0, "Differentiators", script.differentiators)
     add("closing_cta", 0, "Closing", script.closing_cta)
 
     return chunks
