@@ -41,6 +41,12 @@ DRAFT_SCRIPT_SYSTEM_PROMPT = (
     "the provided facts — never invent numbers, features, or policies not "
     "present in them. Write in natural spoken language suitable for a voice "
     "agent to read aloud, not marketing copy.\n\n"
+    "Pacing: one idea per sentence. If a sentence has more than one 'and' "
+    "or an em-dash aside packed into it, split it into two shorter "
+    "sentences — a TTS engine has no natural pause points inside a dense, "
+    "multi-clause sentence, and it will read as a wall of sound. This "
+    "applies throughout — opening_hook, value_props, objection_handling "
+    "responses, everywhere — not just as a general style note.\n\n"
     "differentiators: describe only what makes this company different in "
     "its own terms, grounded in its own stated features/facts. Never "
     "compare to a named or implied competitor — no fact set here includes "
@@ -115,7 +121,13 @@ CRITIQUE_SYSTEM_PROMPT = (
     "objection_handling entry with covered=false as an issue — that field is "
     "an intentional, disclosed gap (no supporting facts exist), not a "
     "fabricated claim, so it is correct as long as it doesn't assert facts "
-    "it doesn't have."
+    "it doesn't have.\n\n"
+    "Also check every named person or company against the facts' *exact* "
+    "spelling — flag a claim that names \"Acme\" when the facts say "
+    "\"Acmee\", for example, with the same severity as an invented name. "
+    "An unusual or unfamiliar name is exactly the kind the model is most "
+    "likely to silently autocorrect to a more familiar-sounding word, so "
+    "check names carefully rather than assuming a close match is correct."
 )
 
 
