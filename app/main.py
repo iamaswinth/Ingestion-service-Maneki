@@ -256,7 +256,7 @@ async def start_sales_script(
         raise HTTPException(status_code=409, detail="Crawl has not completed/persisted yet")
 
     claimed = await salescript_store.claim_generation(state.tenant_id, state.url, job_id)
-    if claimed is None:
+    if not claimed:
         raise HTTPException(
             status_code=409,
             detail="Sales script generation already in progress for this site",

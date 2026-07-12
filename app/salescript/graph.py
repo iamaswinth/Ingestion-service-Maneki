@@ -61,13 +61,19 @@ async def _create_structured(
     *, model: str, max_tokens: int, system: str, schema: dict, user_content: str
 ) -> str:
     """One structured (json_schema) call, with one retry at double the token
-    budget if the first attempt was truncated before any text was written.
+    budget if the first attempt was truncated by hitting max_tokens — whether
+    that cut it off before any text was written, or mid-generation, leaving a
+    partial/invalid JSON string. The latter is the more common case in
+    practice: a verbose generation (a bigger site producing more objections/
+    value props/proof points to write, say) usually gets partway through the
+    JSON before running out of budget, not stopped at zero characters, so
+    checking only "no text block at all" misses most real truncations and
+    lets broken JSON reach the caller's json.loads.
 
-    A single verbose generation (a bigger site producing more objections/value
-    props to critique, say) can occasionally overrun even a generous static
-    max_tokens — this is ordinary LLM output-length variance, not a bug worth
-    failing the whole graph run over, so retry once with headroom before
-    surfacing an error.
+    A single verbose generation can occasionally overrun even a generous
+    static max_tokens — this is ordinary LLM output-length variance, not a
+    bug worth failing the whole graph run over, so retry once with headroom
+    before surfacing an error.
     """
     budget = max_tokens
     for attempt in range(2):
@@ -79,11 +85,16 @@ async def _create_structured(
             messages=[{"role": "user", "content": user_content}],
         )
         try:
-            return _text_of(response)
+            text = _text_of(response)
         except ValueError:
             if attempt == 1:
                 raise
             budget *= 2
+            continue
+        if response.stop_reason == "max_tokens" and attempt == 0:
+            budget *= 2
+            continue
+        return text
 
 
 class SalesScriptState(TypedDict):
@@ -144,7 +155,11 @@ async def derive_icp(state: SalesScriptState) -> dict:
 async def _call_draft_script(prompt: str) -> str:
     return await _create_structured(
         model=settings.sales_script_model,
-        max_tokens=6144,
+        # SalesScript grew (proof_points, qualification_signals, staged
+        # discovery_questions, a fixed 5+-category objection checklist) —
+        # 6144 was sized for the smaller pre-expansion schema and now
+        # truncates mid-JSON on a normal-sized script, not just large sites.
+        max_tokens=8192,
         system=prompts.DRAFT_SCRIPT_SYSTEM_PROMPT,
         schema=SalesScript.model_json_schema(),
         user_content=prompt,

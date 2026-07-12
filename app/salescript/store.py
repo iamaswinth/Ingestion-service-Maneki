@@ -61,14 +61,18 @@ def _row_to_record(row: asyncpg.Record) -> SalesScriptRecord:
     )
 
 
-async def claim_generation(
-    tenant_id: str, site_url: str, job_id: str
-) -> Optional[SalesScriptRecord]:
+async def claim_generation(tenant_id: str, site_url: str, job_id: str) -> bool:
     """Atomically claim the right to run generation for this site.
 
-    Returns the claimed row, or None if another caller already holds
-    status='generating' — the race-safe idiom mirrors
+    Returns True if the claim succeeded, False if another caller already
+    holds status='generating' — the race-safe idiom mirrors
     app/storage.py::mark_persisting's `UPDATE ... WHERE ... RETURNING *`.
+
+    Deliberately returns a bool rather than parsing the claimed row into a
+    SalesScriptRecord: an existing row's `script` JSONB may be in an older
+    shape than the current strict SalesScript schema (e.g. after a schema
+    change), and the caller (app/main.py::start_sales_script) only checks
+    success/failure — it never reads fields off the claimed row.
     """
     pool = await _pool()
     row = await pool.fetchrow(
@@ -79,13 +83,13 @@ async def claim_generation(
             job_id = EXCLUDED.job_id, status = 'generating',
             error = NULL, updated_at = now()
         WHERE sales_scripts.status != 'generating'
-        RETURNING *
+        RETURNING id
         """,
         tenant_id,
         site_url,
         job_id,
     )
-    return _row_to_record(row) if row else None
+    return row is not None
 
 
 async def save_result(
