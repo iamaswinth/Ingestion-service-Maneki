@@ -15,8 +15,10 @@ app/ingestion/questions.py — no langchain-core dependency needed for this.
 """
 
 import asyncio
+import difflib
 import json
 import operator
+import re
 from typing import Annotated, Literal, Optional, TypedDict
 
 from anthropic import AsyncAnthropic
@@ -37,6 +39,52 @@ _EXTRACT_FACTS_SCHEMA = {
     "required": ["facts"],
     "additionalProperties": False,
 }
+
+# 1-4 consecutive Title-Case words, e.g. "Odyssey", "Yuan Teoh", "Merouane
+# Zouaid", "Comp AI" -- a cheap heuristic for "this looks like a proper
+# noun", used by _find_name_drift below. Must include single words: a
+# possessive like "Odyssey's" breaks the multi-word chain at the apostrophe
+# (lowercase "s" doesn't continue the pattern), so a drifted single-word
+# name would never become a candidate if 2+ words were required. Not a real
+# NER model; deliberately simple.
+_NAME_RE = re.compile(r"\b[A-Z][a-zA-Z]*(?:\s+[A-Z][a-zA-Z]*){0,3}\b")
+
+# Common sentence-fillers that only end up capitalized because they sit at
+# the start of a mid-sentence clause (", A Google software engineer, ...")
+# or a sentence -- not because they're part of a name. Stripped from the
+# front of a candidate before whitelist comparison so "A Google" doesn't
+# get treated as drift against the real name "Google".
+_LEADING_STOPWORDS = {
+    "A", "An", "The", "In", "On", "At", "For", "By", "Is", "It", "This",
+    "That", "These", "Those", "We", "Our", "You", "Your", "If", "So",
+    "And", "But", "Or", "With", "From", "To", "Once", "When", "While",
+}
+
+
+def _strip_leading_stopword(phrase: str) -> str:
+    first, _, rest = phrase.partition(" ")
+    return rest if rest and first in _LEADING_STOPWORDS else phrase
+
+
+def _is_abbreviation(candidate: str, whitelist: set[str]) -> bool:
+    """True if `candidate` is a whitespace-boundary prefix or suffix of a
+    whitelisted phrase, or vice versa -- e.g. "Agnost" vs. "Agnost AI"
+    (prefix), or "Voice BDRs" vs. "Our Voice BDRs" (suffix, e.g. a script
+    rephrasing "our" as "your" for a prospect drops the leading word). A
+    company casually dropping its own suffix mid-sentence, or a possessive
+    getting rephrased, is normal variation, not the character-level drift
+    this check is meant to catch; only flag a *different-spelling* near
+    miss, not a *shorter/longer* correct one."""
+    return any(
+        w != candidate
+        and (
+            w.startswith(candidate + " ")
+            or candidate.startswith(w + " ")
+            or w.endswith(" " + candidate)
+            or candidate.endswith(" " + w)
+        )
+        for w in whitelist
+    )
 
 
 def _get_client() -> AsyncAnthropic:
@@ -192,9 +240,67 @@ async def _call_critique(facts: list[str], script: dict) -> str:
     )
 
 
+def _all_strings(obj) -> list[str]:
+    """Every string leaf in a nested dict/list structure, e.g. a SalesScript
+    dict -- used to scan the whole script for name-shaped text regardless of
+    which field it landed in."""
+    if isinstance(obj, str):
+        return [obj]
+    if isinstance(obj, dict):
+        return [s for v in obj.values() for s in _all_strings(v)]
+    if isinstance(obj, list):
+        return [s for v in obj for s in _all_strings(v)]
+    return []
+
+
+def _find_name_drift(facts: list[str], script: dict) -> list[str]:
+    """Deterministic, non-LLM catch for the failure mode where draft_script
+    autocorrects an unusual real name to a more common-sounding word (e.g.
+    "Odysser" -> "Odyssey") and critique's own LLM call doesn't reliably
+    notice, even when explicitly instructed to check exact spelling --
+    LLMs are unreliable at this kind of character-level string comparison.
+
+    Builds a whitelist of name-shaped phrases actually present in the facts,
+    then flags any name-shaped phrase in the script that isn't an exact
+    match but *is* a close one -- that gap is exactly what drift looks like.
+    A phrase that exactly matches the whitelist never reaches the fuzzy
+    check, so two different real similar-sounding names (each individually
+    grounded in the facts) don't false-positive against each other.
+    """
+    whitelist = set(_NAME_RE.findall(" ".join(facts)))
+    raw_candidates = set(_NAME_RE.findall(" ".join(_all_strings(script))))
+    candidates = {_strip_leading_stopword(c) for c in raw_candidates}
+
+    # Short strings make the fuzzy check noisy -- e.g. "Isn" (from a
+    # sentence-opening "Isn't...") vs. "In" (from a quoted testimonial's
+    # opening word) share enough characters to clear the ratio threshold
+    # despite being unrelated. Real name drift (Odysser/Odyssey) is well
+    # above this length; a common short capitalized word isn't a name.
+    long_whitelist = {w for w in whitelist if len(w) >= 4}
+
+    issues = []
+    for candidate in sorted(candidates - whitelist):
+        if len(candidate) < 4 or _is_abbreviation(candidate, whitelist):
+            continue
+        match = difflib.get_close_matches(candidate, long_whitelist, n=1, cutoff=0.8)
+        if match:
+            issues.append(
+                f"\"{candidate}\" does not exactly match the source spelling "
+                f"\"{match[0]}\" -- likely name drift, not a genuine claim."
+            )
+    return issues
+
+
 async def critique_node(state: SalesScriptState) -> dict:
     text = await _call_critique(state["facts"], state["script"])
-    return {"critique": json.loads(text)}
+    critique = json.loads(text)
+
+    drift_issues = _find_name_drift(state["facts"], state["script"])
+    if drift_issues:
+        critique["passed"] = False
+        critique["issues"] = critique.get("issues", []) + drift_issues
+
+    return {"critique": critique}
 
 
 def _should_revise(state: SalesScriptState) -> Literal["revise", "finalize"]:

@@ -59,7 +59,13 @@ def clean_text(markdown: str) -> str:
     This is what gets embedded and spoken — voice output should never
     contain "![Jupiter](https://.../jupiter.png)".
     """
-    text = _IMAGE_RE.sub("", markdown)
+    # A space, not "": some source markdown has an image tag sitting directly
+    # against text on both sides with no whitespace (e.g. an avatar-initials
+    # badge immediately before a testimonial's image+name), and substituting
+    # empty would weld the surrounding words together (e.g. "YT" + "Yuan
+    # Teoh" -> "YTYuan Teoh"). The redundant whitespace this can add in the
+    # common already-spaced case is harmless — collapsed by the next line.
+    text = _IMAGE_RE.sub(" ", markdown)
     text = _LINK_RE.sub(lambda m: m.group(1), text)  # empty capture -> link vanishes entirely
     text = _INLINE_WHITESPACE_RE.sub(" ", text)
     text = _BLANK_LINES_RE.sub("\n\n", text)
