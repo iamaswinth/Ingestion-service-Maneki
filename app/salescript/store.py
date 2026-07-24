@@ -10,10 +10,14 @@ from typing import Optional
 
 import asyncpg
 
-from .. import db
+from .. import db, schema_guard
 from ..models import SalesScriptCritique, SalesScriptRecord
 
 _schema_ready = False
+
+# A generation run is a handful of LLM calls (minutes). A 'generating' row
+# older than this has no live worker behind it and may be re-claimed.
+_STALE_GENERATION = "30 minutes"
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS sales_scripts (
@@ -41,7 +45,12 @@ async def _pool() -> asyncpg.Pool:
     pool = await db.get_pool()
     if not _schema_ready:
         async with pool.acquire() as conn:
-            await conn.execute(_SCHEMA_SQL)
+            # Created in dev/test, only verified in production — see
+            # app/schema_guard.py.
+            if schema_guard.auto_create_enabled():
+                await conn.execute(_SCHEMA_SQL)
+            else:
+                await schema_guard.verify_tables(conn, ("sales_scripts",))
         _schema_ready = True
     return pool
 
@@ -67,6 +76,9 @@ async def claim_generation(tenant_id: str, site_url: str, job_id: str) -> bool:
     Returns True if the claim succeeded, False if another caller already
     holds status='generating' — the race-safe idiom mirrors
     app/storage.py::mark_persisting's `UPDATE ... WHERE ... RETURNING *`.
+    A 'generating' row older than _STALE_GENERATION is treated as abandoned
+    (its worker died without reaching save_result/save_failure) and may be
+    re-claimed, so a crash can't wedge the site permanently.
 
     Deliberately returns a bool rather than parsing the claimed row into a
     SalesScriptRecord: an existing row's `script` JSONB may be in an older
@@ -76,13 +88,14 @@ async def claim_generation(tenant_id: str, site_url: str, job_id: str) -> bool:
     """
     pool = await _pool()
     row = await pool.fetchrow(
-        """
+        f"""
         INSERT INTO sales_scripts (tenant_id, site_url, job_id, status)
         VALUES ($1, $2, $3, 'generating')
         ON CONFLICT (tenant_id, site_url) DO UPDATE SET
             job_id = EXCLUDED.job_id, status = 'generating',
             error = NULL, updated_at = now()
         WHERE sales_scripts.status != 'generating'
+           OR sales_scripts.updated_at < now() - interval '{_STALE_GENERATION}'
         RETURNING id
         """,
         tenant_id,
@@ -90,6 +103,24 @@ async def claim_generation(tenant_id: str, site_url: str, job_id: str) -> bool:
         job_id,
     )
     return row is not None
+
+
+async def reconcile_interrupted_generations() -> int:
+    """Startup-only. A process restart mid-generation leaves rows stuck at
+    status='generating' with no background task left to finish them, and
+    claim_generation then rejects every retry with a 409. Flag them failed
+    so POST /sales-script/{job_id} can re-claim. Returns rows affected.
+    """
+    pool = await _pool()
+    result = await pool.execute(
+        """
+        UPDATE sales_scripts SET status = 'failed',
+                                 error = 'interrupted by server restart',
+                                 updated_at = now()
+        WHERE status = 'generating'
+        """
+    )
+    return int(result.split()[-1])
 
 
 async def save_result(

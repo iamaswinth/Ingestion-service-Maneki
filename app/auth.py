@@ -9,14 +9,13 @@ never "auth is skipped."
 """
 
 import hmac
-from typing import Optional
 
 from fastapi import Header, HTTPException
 
 from .config import settings
 
 
-async def require_internal_token(authorization: Optional[str] = Header(default=None)) -> None:
+async def require_internal_token(authorization: str = Header(default="")) -> None:
     if not authorization or not authorization.startswith("Bearer "):
         raise HTTPException(status_code=401, detail="Missing bearer token")
     token = authorization[len("Bearer "):]

@@ -13,7 +13,7 @@ scraping->persisted transition can be claimed atomically across all of them
 
 import asyncpg
 
-from . import db
+from . import db, schema_guard
 from .models import JobPages, JobState, Page, PageSummary, Section
 
 _schema_ready = False
@@ -38,6 +38,7 @@ CREATE TABLE IF NOT EXISTS jobs (
 
 CREATE INDEX IF NOT EXISTS jobs_tenant_idx ON jobs (tenant_id);
 CREATE INDEX IF NOT EXISTS jobs_ingest_status_idx ON jobs (ingest_status);
+CREATE INDEX IF NOT EXISTS jobs_open_idx ON jobs (status) WHERE persisted = false;
 
 CREATE TABLE IF NOT EXISTS pages (
   job_id         TEXT NOT NULL REFERENCES jobs (job_id) ON DELETE CASCADE,
@@ -62,7 +63,12 @@ async def _pool() -> asyncpg.Pool:
     pool = await db.get_pool()
     if not _schema_ready:
         async with pool.acquire() as conn:
-            await conn.execute(_SCHEMA_SQL)
+            # Created in dev/test, only verified in production — see
+            # app/schema_guard.py.
+            if schema_guard.auto_create_enabled():
+                await conn.execute(_SCHEMA_SQL)
+            else:
+                await schema_guard.verify_tables(conn, ("jobs", "pages"))
         _schema_ready = True
     return pool
 
@@ -149,6 +155,17 @@ async def reconcile_interrupted_jobs() -> int:
         """
     )
     return int(result.split()[-1])
+
+
+async def list_open_jobs() -> list[JobState]:
+    """Jobs the background poller should still check on Firecrawl: not yet
+    persisted and not already terminal locally (Firecrawl won't change a
+    failed/cancelled crawl, so repolling those is wasted work)."""
+    pool = await _pool()
+    rows = await pool.fetch(
+        "SELECT * FROM jobs WHERE persisted = false AND status NOT IN ('failed', 'cancelled')"
+    )
+    return [_row_to_job(row) for row in rows]
 
 
 async def mark_persisting(job_id: str, total_pages: int) -> JobState | None:

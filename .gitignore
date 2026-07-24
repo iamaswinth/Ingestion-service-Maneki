@@ -1,6 +1,7 @@
 # Secrets & scraped output
 .env
 data/
+.fastembed_cache/
 
 # Python
 __pycache__/

@@ -20,7 +20,17 @@ from ..config import settings
 
 @lru_cache(maxsize=1)
 def _model() -> TextEmbedding:
-    return TextEmbedding(model_name=settings.embedding_model)
+    return TextEmbedding(
+        model_name=settings.embedding_model, cache_dir=settings.embedding_cache_dir
+    )
+
+
+def warm() -> None:
+    """Force the model to load now rather than on the first embed call.
+    Called once at startup (app/main.py) so a cold load never lands on a
+    live request; also invoked at Docker build time to bake the model into
+    the image at the same cache_dir."""
+    _model()
 
 
 def embed_documents(texts: list[str]) -> list[list[float]]:

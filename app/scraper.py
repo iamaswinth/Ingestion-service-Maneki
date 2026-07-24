@@ -5,8 +5,10 @@ returns plain dicts / our Pydantic models, so swapping cloud <-> self-hosted or
 upgrading the SDK only touches this file.
 """
 
+import time
 from typing import Any, Optional
 
+import httpx
 from firecrawl import AsyncFirecrawl
 
 from .config import settings
@@ -17,6 +19,7 @@ _client = AsyncFirecrawl(
     api_key=settings.firecrawl_api_key,
     api_url=settings.firecrawl_api_url,
 )
+_http = httpx.AsyncClient(base_url=settings.firecrawl_api_url)
 
 
 def _get(obj: Any, *names: str, default: Any = None) -> Any:
@@ -130,10 +133,24 @@ async def map_site(url: str, limit: int) -> list[str]:
     return out
 
 
+_REACHABLE_CACHE_SECONDS = 45
+_reachable_cache: tuple[float, bool] | None = None
+
+
 async def reachable() -> bool:
-    """Cheap health probe against the Firecrawl instance."""
+    """Cheap health probe against the Firecrawl instance: hits its liveness
+    stub (no crawl/queue work, no outbound request to a third-party site)
+    and caches the result briefly. /health is this app's one unauthenticated
+    endpoint, so keeping each probe near-free matters regardless of who —
+    or how often — is calling it."""
+    global _reachable_cache
+    now = time.monotonic()
+    if _reachable_cache is not None and now - _reachable_cache[0] < _REACHABLE_CACHE_SECONDS:
+        return _reachable_cache[1]
     try:
-        await _client.map(url="https://example.com", limit=1)
-        return True
+        resp = await _http.get("/v0/health/liveness", timeout=5.0)
+        ok = resp.status_code == 200
     except Exception:
-        return False
+        ok = False
+    _reachable_cache = (now, ok)
+    return ok

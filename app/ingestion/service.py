@@ -1,6 +1,7 @@
 """Orchestrates load -> chunk -> embed -> upsert for one completed crawl job."""
 
 import asyncio
+import logging
 
 from .. import storage
 from ..models import Page, PageSummary
@@ -8,6 +9,8 @@ from . import store
 from .chunker import chunk_page
 from .embedder import embed_documents
 from .questions import build_question_chunks, generate_questions
+
+logger = logging.getLogger(__name__)
 
 
 def _to_page(summary: PageSummary) -> Page:
@@ -39,6 +42,10 @@ async def ingest_job(job_id: str) -> tuple[int, int]:
         # Nothing scraped for this job — still clear out any chunks left over
         # from a previous crawl of this site (e.g. the site now 404s).
         await store.delete_site_chunks(job.tenant_id, job.url)
+        logger.warning(
+            "ingest produced 0 chunks: no persisted pages",
+            extra={"job_id": job_id, "tenant_id": job.tenant_id, "site_url": job.url},
+        )
         return 0, 0
 
     content_chunks = [
@@ -50,6 +57,15 @@ async def ingest_job(job_id: str) -> tuple[int, int]:
     ]
     if not content_chunks:
         await store.delete_site_chunks(job.tenant_id, job.url)
+        logger.warning(
+            "ingest produced 0 chunks: chunker returned nothing for every page",
+            extra={
+                "job_id": job_id,
+                "tenant_id": job.tenant_id,
+                "site_url": job.url,
+                "page_count": len(job_pages.pages),
+            },
+        )
         return 0, 0
 
     # Doc2query: synthetic visitor questions as extra vectors (fail-open —
@@ -61,4 +77,16 @@ async def ingest_job(job_id: str) -> tuple[int, int]:
     texts = [c.embedding_text for c in all_chunks]
     embeddings = await asyncio.to_thread(embed_documents, texts)
     await store.replace_site_chunks(job.tenant_id, job.url, all_chunks, embeddings)
+
+    logger.info(
+        "ingest complete",
+        extra={
+            "job_id": job_id,
+            "tenant_id": job.tenant_id,
+            "site_url": job.url,
+            "page_count": len(job_pages.pages),
+            "content_chunk_count": len(content_chunks),
+            "question_chunk_count": len(question_chunks),
+        },
+    )
     return len(content_chunks), len(question_chunks)

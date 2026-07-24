@@ -171,7 +171,10 @@ class QueryRequest(BaseModel):
     # None => use settings.hybrid_search_enabled; explicit True/False overrides
     # per request, for A/B eval of hybrid vs. vector-only.
     hybrid: Optional[bool] = None
-    # When true, populate QueryHit.vector_score/lexical_score for tuning.
+    # None => use settings.rerank_enabled; explicit True/False overrides per
+    # request, for A/B eval of rerank vs. RRF/vector-only ranking.
+    rerank: Optional[bool] = None
+    # When true, populate QueryHit.vector_score/lexical_score/rerank_score for tuning.
     debug: bool = False
 
 
@@ -191,6 +194,9 @@ class QueryHit(BaseModel):
     # hybrid path ran (cosine similarity / ts_rank_cd respectively).
     vector_score: Optional[float] = None
     lexical_score: Optional[float] = None
+    # Cross-encoder relevance score (app/ingestion/reranker.py), populated
+    # only when QueryRequest.debug=True and reranking ran.
+    rerank_score: Optional[float] = None
 
 
 class QueryResponse(BaseModel):

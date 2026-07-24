@@ -18,7 +18,6 @@ _pool: Optional[asyncpg.Pool] = None
 
 
 async def _init_connection(conn: asyncpg.Connection) -> None:
-    await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
     await register_vector(conn)
     # Transparent jsonb <-> Python list/dict roundtrip (used by pages.sections)
     # so callers pass/receive plain Python objects, not raw JSON strings.
@@ -30,6 +29,18 @@ async def _init_connection(conn: asyncpg.Connection) -> None:
 async def get_pool() -> asyncpg.Pool:
     global _pool
     if _pool is None:
+        # register_vector() in _init_connection needs the `vector` type to
+        # already exist in pg_catalog, and _init_connection runs during
+        # create_pool() below (for the pool's initial min_size connections) —
+        # before any schema SQL elsewhere would get a chance to create the
+        # extension. Bootstrap it once here, via a throwaway connection,
+        # rather than repeating the (idempotent but unnecessary) CREATE
+        # EXTENSION on every pooled connection.
+        bootstrap_conn = await asyncpg.connect(settings.database_url)
+        try:
+            await bootstrap_conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        finally:
+            await bootstrap_conn.close()
         _pool = await asyncpg.create_pool(
             settings.database_url, init=_init_connection, min_size=1, max_size=5
         )

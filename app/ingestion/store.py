@@ -10,14 +10,16 @@ isolation boundary. There is no other mechanism keeping tenants apart, so
 never add a query path that skips this filter.
 """
 
+import asyncio
 import logging
 from typing import Optional
 
 import asyncpg
 
-from .. import db
+from .. import db, schema_guard
 from ..config import settings
 from ..models import Chunk, QueryHit
+from .reranker import rerank as rerank_documents
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +93,12 @@ async def get_pool() -> asyncpg.Pool:
     pool = await db.get_pool()
     if not _schema_ready:
         async with pool.acquire() as conn:
-            await conn.execute(_SCHEMA_SQL)
+            # Created in dev/test, only verified in production — see
+            # app/schema_guard.py.
+            if schema_guard.auto_create_enabled():
+                await conn.execute(_SCHEMA_SQL)
+            else:
+                await schema_guard.verify_tables(conn, ("chunks",))
         _schema_ready = True
     return pool
 
@@ -426,6 +433,12 @@ async def _search_hybrid(
     ]
 
 
+async def _rerank_hits(question: str, hits: list[QueryHit], debug: bool) -> list[QueryHit]:
+    scores = await asyncio.to_thread(rerank_documents, question, [h.text for h in hits])
+    ranked = sorted(zip(hits, scores), key=lambda pair: pair[1], reverse=True)
+    return [h.model_copy(update={"rerank_score": s}) if debug else h for h, s in ranked]
+
+
 async def search(
     tenant_id: str,
     embedding: list[float],
@@ -435,14 +448,33 @@ async def search(
     page_url: Optional[str] = None,
     hybrid: Optional[bool] = None,
     debug: bool = False,
+    rerank: Optional[bool] = None,
 ) -> list[QueryHit]:
     use_hybrid = settings.hybrid_search_enabled if hybrid is None else hybrid
-    if not use_hybrid:
-        return await _search_vector_only(tenant_id, embedding, top_k, site_url, page_url)
-    try:
-        return await _search_hybrid(
-            tenant_id, embedding, question, top_k, site_url, page_url, debug
+    use_rerank = settings.rerank_enabled if rerank is None else rerank
+
+    # Fetch more than top_k when reranking so the cross-encoder has real
+    # room to promote a good match that RRF/cosine ranked lower — the final
+    # top_k slice happens only after reranking, below.
+    fetch_k = top_k
+    if use_rerank:
+        fetch_k = max(
+            top_k,
+            min(top_k * settings.rerank_candidate_multiplier, settings.rerank_candidate_ceiling),
         )
-    except Exception:
-        logger.exception("Hybrid search failed; falling back to vector-only")
-        return await _search_vector_only(tenant_id, embedding, top_k, site_url, page_url)
+
+    if not use_hybrid:
+        hits = await _search_vector_only(tenant_id, embedding, fetch_k, site_url, page_url)
+    else:
+        try:
+            hits = await _search_hybrid(
+                tenant_id, embedding, question, fetch_k, site_url, page_url, debug
+            )
+        except Exception:
+            logger.exception("Hybrid search failed; falling back to vector-only")
+            hits = await _search_vector_only(tenant_id, embedding, fetch_k, site_url, page_url)
+
+    if use_rerank and hits:
+        hits = await _rerank_hits(question, hits, debug)
+
+    return hits[:top_k]

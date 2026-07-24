@@ -43,8 +43,18 @@ class Settings(BaseSettings):
     # column in app/ingestion/store.py if ever changed.
     embedding_model: str = "BAAI/bge-small-en-v1.5"
 
+    # Explicit cache path (rather than fastembed's OS-temp-dir default) so the
+    # model baked into the Docker image at build time is guaranteed to still be
+    # there at runtime, even if the platform mounts /tmp as ephemeral tmpfs.
+    embedding_cache_dir: str = ".fastembed_cache"
+
     # Automatically ingest a crawl into the vector DB once it finishes scraping.
     auto_ingest: bool = True
+
+    # Background loop that finishes crawls no client has polled since Firecrawl
+    # completed them (see _poll_open_jobs in app/main.py). Off switch for tests.
+    scrape_poll_enabled: bool = True
+    scrape_poll_interval_seconds: int = 15
 
     # Chunking knobs (app/ingestion/chunker.py).
     chunk_target_chars: int = 1000
@@ -71,6 +81,18 @@ class Settings(BaseSettings):
     hybrid_candidate_multiplier: int = 8
     hybrid_candidate_floor: int = 50
 
+    # --- Reranking: cross-encoder re-scores retrieval results before top_k ---
+    rerank_enabled: bool = True
+    rerank_model: str = "Xenova/ms-marco-MiniLM-L-6-v2"
+    # Extra candidates fetched (from whichever retrieval path ran) before
+    # truncating to the requested top_k, so the reranker has real room to
+    # promote a good match that RRF/cosine ranked lower — same intent as
+    # hybrid_candidate_multiplier, opposite direction from hybrid_candidate_floor
+    # (this bounds a maximum, not a minimum, so a top_k=20 request doesn't
+    # balloon rerank cost).
+    rerank_candidate_multiplier: int = 4
+    rerank_candidate_ceiling: int = 50
+
     # --- Sales script generation (app/salescript/) ---
     # An explicit, user-triggered action (unlike doc2query's silent fail-open)
     # so disabling it should surface as an error, not a no-op.
@@ -90,6 +112,21 @@ class Settings(BaseSettings):
     langchain_tracing_v2: bool = False
     langchain_api_key: str = ""
     langchain_project: str = "firecrawl-sales-script"
+
+    # Deployment environment. "production"/"staging" make app/startup_checks.py
+    # strict: an unset secret becomes a refusal to start instead of a silent
+    # default. Anything else (the default) only warns, so local dev and tests
+    # keep working with no .env at all.
+    environment: str = "development"
+
+    # --- Observability ---
+    log_level: str = "INFO"
+    log_json: bool = True
+    # Fail-open like anthropic_api_key/langchain_api_key above: an unset DSN
+    # means Sentry is simply never initialized, not an error.
+    sentry_dsn: str = ""
+    sentry_environment: str = "development"
+    sentry_traces_sample_rate: float = 0.0
 
 
 settings = Settings()

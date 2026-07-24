@@ -11,13 +11,22 @@ Flow:
     POST /sales-script/{tenant_id}/approve -> approve a pending_review script; indexes it into chunks
     POST /query                         -> hybrid (vector + lexical) search over a tenant's chunks
     GET  /map?url=                      -> preview URLs before committing to a crawl
-    GET  /health                        -> Firecrawl + database reachability
+    GET  /health                        -> Firecrawl + database reachability (diagnostic)
+    GET  /health/live                   -> DB-only liveness probe for load balancers
 """
 
 import asyncio
+import contextlib
+import logging
+from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Response
+
+from .observability import configure_logging, init_sentry
+
+configure_logging()
+init_sentry()
 
 from . import db, scraper, storage
 from .auth import require_internal_token
@@ -25,6 +34,8 @@ from .config import settings
 from .ingestion import service as ingestion_service
 from .ingestion import store as ingestion_store
 from .ingestion.embedder import embed_query
+from .ingestion.embedder import warm as warm_embedder
+from .ingestion.reranker import warm as warm_reranker
 from .models import (
     IngestResult,
     JobCreated,
@@ -40,28 +51,75 @@ from .models import (
 )
 from .salescript import service as salescript_service
 from .salescript import store as salescript_store
+from .startup_checks import validate_settings
+
+logger = logging.getLogger(__name__)
+
+_poll_task: asyncio.Task | None = None
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _poll_task
+
+    # Before anything else, and deliberately not swallowed: a misconfigured
+    # process should never reach the point of looking healthy.
+    validate_settings()
+
+    async def _warm_db() -> None:
+        # Don't fail app startup if the DB isn't reachable yet — /health surfaces
+        # this, and scraping still works without it. Ingestion just fails until fixed.
+        try:
+            await ingestion_store.get_pool()
+            await storage.reconcile_interrupted_jobs()
+            await salescript_store.reconcile_interrupted_generations()
+        except Exception:
+            logger.exception("DB warm-up/reconcile failed at startup")
+
+    # Embedder/reranker warm-up is deliberately not swallowed like the DB
+    # block above: if either model can't load, every /query will fail
+    # anyway, so it's better to fail loudly at container boot than silently
+    # 500 on the first live voice question (see app/ingestion/embedder.py::warm).
+    await asyncio.gather(
+        _warm_db(), asyncio.to_thread(warm_embedder), asyncio.to_thread(warm_reranker)
+    )
+
+    if settings.scrape_poll_enabled:
+        _poll_task = asyncio.create_task(_poll_open_jobs())
+
+    yield
+
+    if _poll_task is not None:
+        _poll_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await _poll_task
+    await db.close_pool()
+
 
 app = FastAPI(
     title="Firecrawl Scraping + Ingestion Pipeline",
     description="Paste a website URL; crawl, chunk, and embed it for voice-agent Q&A and navigation.",
     version="0.2.0",
+    lifespan=lifespan,
 )
 
 
-@app.on_event("startup")
-async def on_startup() -> None:
-    # Don't fail app startup if the DB isn't reachable yet — /health surfaces
-    # this, and scraping still works without it. Ingestion just fails until fixed.
-    try:
-        await ingestion_store.get_pool()
-        await storage.reconcile_interrupted_jobs()
-    except Exception:
-        pass
-
-
-@app.on_event("shutdown")
-async def on_shutdown() -> None:
-    await db.close_pool()
+async def _poll_open_jobs() -> None:
+    """Advances any crawl no client has polled since it finished on
+    Firecrawl's side, so persist+auto-ingest happen without depending on
+    GET /scrape/{job_id} being called."""
+    while True:
+        try:
+            for job in await storage.list_open_jobs():
+                try:
+                    state, should_ingest = await _advance_scrape(job.job_id)
+                    if should_ingest:
+                        asyncio.create_task(_run_ingest(job.job_id))
+                except Exception:
+                    pass  # transient Firecrawl/DB error; retry next tick
+        except Exception:
+            pass
+        await asyncio.sleep(settings.scrape_poll_interval_seconds)
 
 
 async def _run_ingest(job_id: str) -> None:
@@ -77,28 +135,45 @@ async def _run_ingest(job_id: str) -> None:
         state.ingested_questions = question_count
         state.ingest_error = None
     except Exception as exc:
+        logger.exception("ingest failed for job_id=%s", job_id)
         state = await storage.load_job(job_id) or state
         state.ingest_status = "ingest_failed"
         state.ingest_error = str(exc)
     await storage.save_job(state)
 
 
-@app.get("/health")
-async def health() -> dict:
-    firecrawl_ok = await scraper.reachable()
-    db_ok = True
+async def _db_reachable() -> bool:
     try:
         pool = await ingestion_store.get_pool()
         async with pool.acquire() as conn:
             await conn.fetchval("SELECT 1")
+        return True
     except Exception:
-        db_ok = False
+        return False
+
+
+@app.get("/health")
+async def health() -> dict:
+    firecrawl_ok = await scraper.reachable()
+    db_ok = await _db_reachable()
     return {
         "status": "ok" if firecrawl_ok and db_ok else "degraded",
         "firecrawl_url": settings.firecrawl_api_url,
         "firecrawl_reachable": firecrawl_ok,
         "database_reachable": db_ok,
     }
+
+
+@app.get("/health/live")
+async def health_live(response: Response) -> dict:
+    """DB-only liveness probe for a load balancer — no Firecrawl call at
+    all, so LB probe traffic can never trigger outbound Firecrawl work.
+    Point the LB health check here, not at /health (which is a fuller
+    diagnostic view and shouldn't gate routing on Firecrawl's own uptime)."""
+    ok = await _db_reachable()
+    if not ok:
+        response.status_code = 503
+    return {"status": "ok" if ok else "down"}
 
 
 @app.post(
@@ -129,24 +204,28 @@ async def start_scrape(req: ScrapeRequest) -> JobCreated:
     return JobCreated(job_id=job_id, url=url, tenant_id=req.tenant_id)
 
 
-@app.get(
-    "/scrape/{job_id}", response_model=JobState, dependencies=[Depends(require_internal_token)]
-)
-async def get_scrape(job_id: str, background_tasks: BackgroundTasks) -> JobState:
-    state = await storage.load_job(job_id)
-    if state is None:
-        raise HTTPException(status_code=404, detail="Unknown job_id")
+async def _advance_scrape(job_id: str) -> tuple[JobState | None, bool]:
+    """Check Firecrawl for one job's status and, if the crawl has finished,
+    claim+persist its pages. Returns (state, should_ingest); the caller
+    decides how to schedule _run_ingest (BackgroundTasks vs asyncio.create_task).
+    Raises RuntimeError on Firecrawl/persist errors.
 
-    # Once persisted, trust stored state — no need to hit Firecrawl again.
-    # (Ingestion may still be running in the background; the job row reflects
-    # its progress on every load, so this keeps returning fresh status.)
-    if state.persisted:
-        return state
+    Shared by GET /scrape/{job_id} (client-polled) and _poll_open_jobs (the
+    background loop that advances jobs nobody is polling) so both go through
+    the same atomic-claim path (storage.mark_persisting/revert_persisting).
+    """
+    state = await storage.load_job(job_id)
+    if state is None or state.persisted:
+        # Once persisted, trust stored state — no need to hit Firecrawl again.
+        # (Ingestion may still be running in the background; the job row
+        # reflects its progress on every load, so callers keep seeing fresh
+        # status without this function doing anything further.)
+        return state, False
 
     try:
         live = await scraper.get_status(job_id)
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Failed to read crawl status: {exc}")
+        raise RuntimeError(f"Failed to read crawl status: {exc}") from exc
 
     state.status = live["status"]
     state.completed_pages = live["completed"]
@@ -154,30 +233,46 @@ async def get_scrape(job_id: str, background_tasks: BackgroundTasks) -> JobState
 
     if state.status != "completed":
         await storage.save_job(state)
-        return state
+        return state, False
 
-    # Two requests — even across different processes/replicas — can both
-    # observe persisted=False and reach here at once right as the crawl
-    # finishes. This atomic UPDATE lets only one of them win the race, so
-    # only one persists pages and schedules ingestion.
+    # Two callers — even across different processes/replicas, or this
+    # function racing the background poller — can both observe
+    # persisted=False and reach here at once right as the crawl finishes.
+    # This atomic UPDATE lets only one of them win the race, so only one
+    # persists pages and schedules ingestion.
     claimed = await storage.mark_persisting(job_id, live["total"])
     if claimed is None:
-        return await storage.load_job(job_id) or state
+        return await storage.load_job(job_id) or state, False
 
     try:
         pages = scraper.to_pages(live["data"])
         summaries = await storage.persist_pages(job_id, pages)
     except Exception as exc:
         await storage.revert_persisting(job_id, str(exc))
-        raise HTTPException(status_code=502, detail=f"Failed to persist pages: {exc}")
+        raise RuntimeError(f"Failed to persist pages: {exc}") from exc
 
     claimed.completed_pages = len(summaries)
-    if settings.auto_ingest:
+    should_ingest = settings.auto_ingest
+    if should_ingest:
         claimed.ingest_status = "ingesting"
-        background_tasks.add_task(_run_ingest, job_id)
 
     await storage.save_job(claimed)
-    return claimed
+    return claimed, should_ingest
+
+
+@app.get(
+    "/scrape/{job_id}", response_model=JobState, dependencies=[Depends(require_internal_token)]
+)
+async def get_scrape(job_id: str, background_tasks: BackgroundTasks) -> JobState:
+    try:
+        state, should_ingest = await _advance_scrape(job_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    if state is None:
+        raise HTTPException(status_code=404, detail="Unknown job_id")
+    if should_ingest:
+        background_tasks.add_task(_run_ingest, job_id)
+    return state
 
 
 @app.get(
@@ -213,6 +308,7 @@ async def trigger_ingest(job_id: str) -> IngestResult:
     try:
         chunk_count, question_count = await ingestion_service.ingest_job(job_id)
     except Exception as exc:
+        logger.exception("ingest failed for job_id=%s", job_id)
         state = await storage.load_job(job_id) or state
         state.ingest_status = "ingest_failed"
         state.ingest_error = str(exc)
@@ -333,6 +429,7 @@ async def query(req: QueryRequest) -> QueryResponse:
         page_url=req.page_url,
         hybrid=req.hybrid,
         debug=req.debug,
+        rerank=req.rerank,
     )
     return QueryResponse(hits=hits)
 

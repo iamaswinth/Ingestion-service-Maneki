@@ -58,7 +58,8 @@ containers with `docker compose up -d --scale api=N`.
 
 Prod uses a free [Neon](https://neon.tech) project (just paste its connection
 string into `DATABASE_URL` — we run `CREATE EXTENSION vector` ourselves, no
-manual setup needed). For local dev, run pgvector in Docker:
+manual setup needed; append `?ssl=require` to the connection string, since
+Neon requires SSL). For local dev, run pgvector in Docker:
 
 ```bash
 docker run -d --name pgvector -p 5433:5432 -e POSTGRES_PASSWORD=postgres pgvector/pgvector:pg16
@@ -87,7 +88,8 @@ downloads the model (~130MB, one time).
 | `POST` | `/ingest/{job_id}` | Manually (re-)run ingestion for a completed crawl. Idempotent. |
 | `POST` | `/query` | Body: `{"tenant_id", "question", "top_k"?, "site_url"?, "page_url"?}`. Vector search scoped to the tenant. |
 | `GET` | `/map?url=` | Preview discovered URLs before committing to a crawl. |
-| `GET` | `/health` | Firecrawl + database reachability. |
+| `GET` | `/health` | Firecrawl + database reachability (diagnostic; Firecrawl check is cached ~45s). |
+| `GET` | `/health/live` | DB-only liveness probe — point a load balancer's health check here, not at `/health`. |
 
 ### Example
 
@@ -133,6 +135,22 @@ when there's no id, or the bare page URL as a last resort. Markdown images and
 link brackets are stripped before embedding/storage so voice output never
 includes `![Jupiter](https://.../jupiter.png)`.
 
+## Retrieval
+
+`POST /query` runs three stages, each independently toggleable per-request
+(`hybrid`/`rerank` on `QueryRequest`) or via `.env`:
+
+1. **Vector search** — cosine similarity over `fastembed` embeddings (pgvector).
+2. **Hybrid fusion** — Postgres full-text search fused with the vector leg via
+   Reciprocal Rank Fusion (RRF), so lexical matches (exact terms) and semantic
+   matches both contribute (`HYBRID_*` settings). Falls back to vector-only if
+   the hybrid query errors.
+3. **Reranking** — a local cross-encoder (`fastembed`, `RERANK_MODEL`, default
+   `Xenova/ms-marco-MiniLM-L-6-v2` — no API key, same footprint as the
+   embedding model) re-scores the fused candidates by actually reading the
+   query against each one's text, then the final `top_k` is sliced off *after*
+   reranking. Set `RERANK_ENABLED=false` to skip this stage.
+
 ## Doc2query (AI-generated questions)
 
 At ingest time, Claude Haiku (`claude-haiku-4-5`) generates ~3 questions each
@@ -153,6 +171,33 @@ always filters `WHERE tenant_id = ...` — this is the entire isolation
 boundary, so any new query path must preserve it. Re-ingesting a job deletes
 its previous chunks first (`DELETE ... WHERE tenant_id=... AND job_id=...`),
 so re-running ingestion is safe and idempotent.
+
+## Deploying
+
+```bash
+docker build -t ingestion .
+docker run -p 8000:8000 --env-file .env ingestion
+```
+
+The image bakes the fastembed model in at build time (see `app/ingestion/embedder.py`), so
+a fresh container never pays a model download on its first `/query`. `WEB_CONCURRENCY`
+controls the number of `uvicorn` worker processes in prod (default `2`) — safe to raise
+per-replica; see "Stateless API" below for why concurrent workers/replicas don't race.
+
+CI (`.github/workflows/ci.yml`) runs `pytest` on every push/PR to `main` — no live
+Postgres/Firecrawl needed, since the test client never triggers app startup (see
+`tests/test_auth.py`).
+
+## Observability
+
+Logs are JSON on stdout by default (`LOG_JSON=true`) — one object per line, structured for
+whatever log aggregator the eventual host provides, matching the 12-factor "log to stdout"
+pattern the `Dockerfile` already assumes. Error tracking via Sentry is opt-in
+(`SENTRY_DSN`) and a no-op until set. When a tenant reports "the voice agent doesn't know
+anything about my site," the first place to look is the per-job ingest summary logged by
+`app/ingestion/service.py::ingest_job` — it logs a `WARNING` on both zero-chunk paths (no
+persisted pages, or the chunker produced nothing) and an `INFO` "ingest complete" line with
+page/chunk counts on success, all tagged with `job_id`/`tenant_id`/`site_url`.
 
 ## Design notes
 
