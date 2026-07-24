@@ -298,6 +298,34 @@ async def _search_vector_only(
     ]
 
 
+def _normalize_rrf(raw_score: float) -> float:
+    """Map a raw RRF fusion score onto 0..1 so it is comparable with the
+    cosine similarity `_search_vector_only` returns.
+
+    Raw RRF lives on a scale set entirely by `hybrid_rrf_k`: the best a chunk
+    can score is `(w_vec + w_lex) / (k + 1)` — about **0.033** at the default
+    k=60 — while the vector-only path returns cosine similarity in 0..1.
+
+    One `score` field carrying two incompatible scales is not a cosmetic
+    inconsistency: `hybrid_search_enabled` defaults to true, and
+    voice_runtime's `retrieval_agentic_score_threshold` (0.35, calibrated for
+    cosine) is then mathematically unreachable. Every hit is judged "thin",
+    the agent discards a perfectly good knowledge base, and every grounded
+    question falls through to "I don't have any information about that".
+
+    After normalising: rank 1 in both legs = 1.0, rank 1 in a single leg =
+    0.5, and something scraping in at rank ~50 of one leg lands near 0.28 —
+    so the existing 0.35 threshold recovers its intended meaning of "actually
+    ranked well by at least one retriever".
+    """
+    best_possible = (
+        settings.hybrid_vector_weight + settings.hybrid_lexical_weight
+    ) / (settings.hybrid_rrf_k + 1)
+    if best_possible <= 0:
+        return 0.0
+    return min(raw_score / best_possible, 1.0)
+
+
 async def _search_hybrid(
     tenant_id: str,
     embedding: list[float],
@@ -414,7 +442,7 @@ async def _search_hybrid(
     return [
         QueryHit(
             text=row["text"],
-            score=float(row["rrf_score"]),
+            score=_normalize_rrf(float(row["rrf_score"])),
             page_url=row["page_url"],
             section_id=row["section_id"],
             title=row["title"],
