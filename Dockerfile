@@ -6,6 +6,10 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app ./app
+# app/migrate.py resolves migrations/ relative to the package parent, so the
+# image needs it too — `python -m app.migrate` is a deploy step, and without
+# this it fails with "migrations directory not found".
+COPY migrations ./migrations
 
 # Bake the fastembed embedding + reranking models into the image at the
 # same cache_dir the app uses at runtime (app/config.py: embedding_cache_dir),
