@@ -13,7 +13,7 @@ from ..config import settings
 from ..ingestion import store as ingestion_store
 from ..ingestion.embedder import embed_documents
 from ..models import SalesScriptRecord
-from . import sectioning, store
+from . import playbooks, sectioning, store
 from .chunker import sales_script_to_chunks
 from .graph import graph
 
@@ -50,7 +50,7 @@ async def run_generation(tenant_id: str, site_url: str, job_id: str) -> None:
                 "site_url": site_url,
                 "pages": pages,
                 "facts": [],
-                "icp": None,
+                "profile": None,
                 "script": None,
                 "critique": None,
                 "revision_count": 0,
@@ -61,6 +61,7 @@ async def run_generation(tenant_id: str, site_url: str, job_id: str) -> None:
             tenant_id,
             site_url,
             final_state["script"],
+            final_state["profile"],
             final_state["critique"],
             final_state["revision_count"],
         )
@@ -95,8 +96,16 @@ async def approve_and_index(
             raise SalesScriptNotFound(f"{tenant_id}:{site_url}")
         raise SalesScriptWrongState(existing.status)
 
+    # site_profile is None for rows generated before this column existed —
+    # playbooks.get(None) falls back to the fully-generic "other" playbook.
+    archetype = record.site_profile.archetype if record.site_profile else None
+    playbook = playbooks.get(archetype)
     chunks = sales_script_to_chunks(
-        record.script, tenant_id=tenant_id, job_id=record.job_id, site_url=site_url
+        record.script,
+        tenant_id=tenant_id,
+        job_id=record.job_id,
+        site_url=site_url,
+        playbook=playbook,
     )
     embeddings = (
         await asyncio.to_thread(embed_documents, [c.embedding_text for c in chunks])

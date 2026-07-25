@@ -11,7 +11,7 @@ from typing import Optional
 import asyncpg
 
 from .. import db, schema_guard
-from ..models import SalesScriptCritique, SalesScriptRecord
+from ..models import SalesScriptCritique, SalesScriptRecord, SiteProfile
 
 _schema_ready = False
 
@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS sales_scripts (
   job_id         TEXT NOT NULL,
   status         TEXT NOT NULL DEFAULT 'not_started',
   script         JSONB,
+  site_profile   JSONB,
   critique       JSONB,
   revision_count INT NOT NULL DEFAULT 0,
   error          TEXT,
@@ -62,6 +63,11 @@ def _row_to_record(row: asyncpg.Record) -> SalesScriptRecord:
         job_id=row["job_id"],
         status=row["status"],
         script=row["script"],
+        # None for rows written before this column existed, or for any
+        # generation that failed before profile_site completed — callers
+        # (e.g. app/salescript/service.py) treat that as archetype="other"
+        # via playbooks.get(None).
+        site_profile=SiteProfile(**row["site_profile"]) if row["site_profile"] else None,
         critique=SalesScriptCritique(**row["critique"]) if row["critique"] else None,
         revision_count=row["revision_count"],
         error=row["error"],
@@ -127,6 +133,7 @@ async def save_result(
     tenant_id: str,
     site_url: str,
     script: dict,
+    site_profile: Optional[dict],
     critique: Optional[dict],
     revision_count: int,
 ) -> None:
@@ -134,13 +141,14 @@ async def save_result(
     await pool.execute(
         """
         UPDATE sales_scripts SET
-            status = 'pending_review', script = $3, critique = $4,
-            revision_count = $5, error = NULL, updated_at = now()
+            status = 'pending_review', script = $3, site_profile = $4,
+            critique = $5, revision_count = $6, error = NULL, updated_at = now()
         WHERE tenant_id = $1 AND site_url = $2
         """,
         tenant_id,
         site_url,
         script,
+        site_profile,
         critique,
         revision_count,
     )

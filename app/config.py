@@ -131,7 +131,7 @@ class Settings(BaseSettings):
     # so disabling it should surface as an error, not a no-op.
     sales_script_enabled: bool = True
     sales_script_extract_model: str = "claude-haiku-4-5"  # extract_facts tier
-    sales_script_model: str = "claude-sonnet-5"  # derive_icp/draft/critique tier
+    sales_script_model: str = "claude-sonnet-5"  # profile_site/draft/critique tier
     sales_script_max_revisions: int = 2
     sales_script_max_page_chars: int = 8000
     sales_script_page_batch_size: int = 1

@@ -14,6 +14,20 @@ from app.salescript import service as salescript_service
 from app.salescript import store as salescript_store
 
 
+def _minimal_profile(archetype: str = "portfolio") -> dict:
+    """A minimal but schema-valid SiteProfile payload (app/models.py)."""
+    return {
+        "archetype": archetype,
+        "reasoning": "The site is a single person's project showcase.",
+        "audience": "prospective clients evaluating the person's work",
+        "visitor_goals": ["see recent work", "check availability"],
+        "conversion_triggers": ["seeing relevant past work", "clear rates"],
+        "primary_action": "get in touch about a project",
+        "tone": "warm and direct",
+        "publishes_pricing": False,
+    }
+
+
 def _minimal_script() -> dict:
     """A minimal but schema-valid SalesScript payload — fields taken
     directly from app/salescript/chunker.py::sales_script_to_chunks's usage
@@ -103,7 +117,7 @@ async def test_reconcile_interrupted_generations(pg_tenant):
 
     # No stuck rows left -> running it again finds nothing new for this row.
     await salescript_store.claim_generation(tenant_id, site_url, "job-2")
-    await salescript_store.save_result(tenant_id, site_url, _minimal_script(), None, 0)
+    await salescript_store.save_result(tenant_id, site_url, _minimal_script(), None, None, 0)
     count2 = await salescript_store.reconcile_interrupted_generations()
     record2 = await salescript_store.load_current(tenant_id, site_url)
     assert record2.status == "pending_review"  # untouched by reconcile
@@ -112,7 +126,7 @@ async def test_reconcile_interrupted_generations(pg_tenant):
 async def test_approve_flips_pending_review_to_ready_and_guards_wrong_state(pg_tenant):
     tenant_id, site_url = pg_tenant
     await salescript_store.claim_generation(tenant_id, site_url, "job-1")
-    await salescript_store.save_result(tenant_id, site_url, _minimal_script(), None, 0)
+    await salescript_store.save_result(tenant_id, site_url, _minimal_script(), None, None, 0)
 
     approved = await salescript_store.approve(tenant_id, site_url)
     assert approved is not None
@@ -123,10 +137,35 @@ async def test_approve_flips_pending_review_to_ready_and_guards_wrong_state(pg_t
     assert second is None
 
 
+async def test_save_result_round_trips_site_profile(pg_tenant):
+    tenant_id, site_url = pg_tenant
+    await salescript_store.claim_generation(tenant_id, site_url, "job-1")
+    await salescript_store.save_result(
+        tenant_id, site_url, _minimal_script(), _minimal_profile("portfolio"), None, 0
+    )
+
+    record = await salescript_store.load_current(tenant_id, site_url)
+    assert record.site_profile is not None
+    assert record.site_profile.archetype == "portfolio"
+    assert record.site_profile.publishes_pricing is False
+
+
+async def test_load_current_tolerates_null_site_profile(pg_tenant):
+    """A row saved before this column existed (or a save_result call that
+    passes None) must still load — a pre-existing sales_scripts row with
+    site_profile IS NULL is exactly this case."""
+    tenant_id, site_url = pg_tenant
+    await salescript_store.claim_generation(tenant_id, site_url, "job-1")
+    await salescript_store.save_result(tenant_id, site_url, _minimal_script(), None, None, 0)
+
+    record = await salescript_store.load_current(tenant_id, site_url)
+    assert record.site_profile is None
+
+
 async def test_approve_and_index_writes_sales_script_chunks(pg_tenant, monkeypatch):
     tenant_id, site_url = pg_tenant
     await salescript_store.claim_generation(tenant_id, site_url, "job-1")
-    await salescript_store.save_result(tenant_id, site_url, _minimal_script(), None, 0)
+    await salescript_store.save_result(tenant_id, site_url, _minimal_script(), None, None, 0)
 
     # pgvector's cosine distance (<=>) is undefined for an all-zero vector,
     # so the fake embedding must be a real (non-zero) unit vector.
@@ -151,6 +190,41 @@ async def test_approve_and_index_writes_sales_script_chunks(pg_tenant, monkeypat
             top_k=indexed, hybrid=False,
         )
         assert any(h.text == _minimal_script()["pricing_talk_track"] for h in hits)
+    finally:
+        await ingestion_store.delete_site_chunks(tenant_id, site_url)
+        pool = await ingestion_store.get_pool()
+        await pool.execute(
+            "DELETE FROM chunks WHERE tenant_id = $1 AND site_url = $2 AND kind = 'sales_script'",
+            tenant_id, site_url,
+        )
+
+
+async def test_approve_and_index_uses_archetype_playbook_labels(pg_tenant, monkeypatch):
+    """A portfolio-archetype script's pricing_talk_track chunk should be
+    titled from the portfolio playbook ("Rates & Availability"), not the
+    generic/SaaS "Pricing" label — proves approve_and_index resolves the
+    stored site_profile into the right Playbook before chunking."""
+    tenant_id, site_url = pg_tenant
+    await salescript_store.claim_generation(tenant_id, site_url, "job-1")
+    await salescript_store.save_result(
+        tenant_id, site_url, _minimal_script(), _minimal_profile("portfolio"), None, 0
+    )
+
+    fake_vector = [1.0] + [0.0] * 383
+    monkeypatch.setattr(
+        salescript_service, "embed_documents", lambda texts: [fake_vector for _ in texts]
+    )
+
+    try:
+        record, indexed = await salescript_service.approve_and_index(tenant_id, site_url)
+        assert indexed > 0
+
+        hits = await ingestion_store.search(
+            tenant_id=tenant_id, embedding=fake_vector, question="pricing",
+            top_k=indexed, hybrid=False,
+        )
+        assert any(h.title == "Rates & Availability" for h in hits)
+        assert not any(h.title == "Pricing" for h in hits)
     finally:
         await ingestion_store.delete_site_chunks(tenant_id, site_url)
         pool = await ingestion_store.get_pool()

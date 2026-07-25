@@ -11,7 +11,16 @@ JobStatus = Literal["scraping", "completed", "failed", "cancelled"]
 IngestStatus = Literal["not_started", "ingesting", "ingested", "ingest_failed"]
 
 ContentType = Literal[
-    "hero", "feature", "pricing", "faq", "testimonial", "generic", "sales_script"
+    "hero",
+    "feature",
+    "pricing",
+    "faq",
+    "testimonial",
+    "about",
+    "contact",
+    "project",
+    "generic",
+    "sales_script",
 ]
 
 AnchorType = Literal["id", "text", "page"]
@@ -222,13 +231,22 @@ class ObjectionQA(BaseModel):
 
     objection: str
     response: str
-    # False when this is a known-important objection category (see the fixed
-    # checklist in DRAFT_SCRIPT_SYSTEM_PROMPT) with no supporting facts on the
-    # site — a disclosed gap for the human reviewer, not a hallucinated answer.
+    # False when this is a known-important concern category (see the
+    # archetype's playbook.concern_checklist in app/salescript/playbooks.py)
+    # with no supporting facts on the site — a disclosed gap for the human
+    # reviewer, not a hallucinated answer.
     covered: bool
 
 
-DiscoveryStage = Literal["situation", "problem", "implication", "need_payoff"]
+# SPIN stages (situation/problem/implication/need_payoff) fit an enterprise
+# sales discovery flow; context/goal/fit are the neutral equivalents used by
+# non-sales playbooks (portfolio, creator_media, nonprofit, etc — see
+# app/salescript/playbooks.py). Which stages a given script actually uses is
+# decided by the playbook, not by this type — it's widened, not narrowed, so
+# older data with the SPIN stages still validates.
+DiscoveryStage = Literal[
+    "situation", "problem", "implication", "need_payoff", "context", "goal", "fit"
+]
 
 
 class DiscoveryQuestion(BaseModel):
@@ -266,17 +284,58 @@ class SalesScript(BaseModel):
     closing_cta: str
     # Short descriptions of what to listen for during discovery (e.g. "team
     # size", "current tool being replaced", "budget authority", "urgency/
-    # timeline") for a future CRM/lead-capture handoff. Derived from the ICP,
-    # not conversational script content — not indexed into chunks.
+    # timeline" for a SaaS site; "project scope", "timeline", "budget range"
+    # for a portfolio) for a future CRM/lead-capture handoff. Derived from the
+    # SiteProfile, not conversational script content — not indexed into chunks.
     qualification_signals: list[str]
 
 
-class IcpProfile(BaseModel):
+# What kind of site this is — decides which playbook (app/salescript/
+# playbooks.py) shapes the draft/critique prompts. "other" is a deliberate,
+# fully-generic fallback rather than forcing a bad fit onto a site that
+# doesn't match any of the named archetypes.
+SiteArchetype = Literal[
+    "saas_product",
+    "ecommerce",
+    "local_service",
+    "professional_services",
+    "portfolio",
+    "creator_media",
+    "nonprofit",
+    "other",
+]
+
+
+class SiteProfile(BaseModel):
+    """What profile_site (app/salescript/graph.py) infers about the crawled
+    site before drafting — replaces the old IcpProfile, which assumed every
+    tenant was a company with a buying committee to profile. This is inferred
+    from the crawl itself, not read from tenant_config (ingestion has no
+    dependency on api-gateway)."""
+
     model_config = ConfigDict(extra="forbid")
 
-    ideal_customer: str
-    top_pain_points: list[str]
-    buying_triggers: list[str] = []
+    archetype: SiteArchetype
+    # One sentence justifying the archetype call, for the human reviewer.
+    reasoning: str
+    # Who visits this site (e.g. "recruiters and prospective clients
+    # evaluating the designer's work").
+    audience: str
+    # What visitors came to do (was: top_pain_points — "pain point" presumes
+    # a problem being sold against, which doesn't fit e.g. a portfolio).
+    visitor_goals: list[str]
+    # What makes a visitor act (was: buying_triggers).
+    conversion_triggers: list[str]
+    # The one thing this site most wants a visitor to do (book a call, start
+    # a project enquiry, buy, donate, subscribe, ...).
+    primary_action: str
+    # How the site talks about itself (e.g. "playful and informal", "terse
+    # and technical", "warm and reassuring") — grounds the script's voice.
+    tone: str
+    # Whether the site actually states prices/rates anywhere, vs. only
+    # "contact us" — lets draft_script write a confident bridge instead of a
+    # vague deflection when there's genuinely nothing to quote.
+    publishes_pricing: bool
 
 
 class SalesScriptCritique(BaseModel):
@@ -294,6 +353,10 @@ class SalesScriptRecord(BaseModel):
     job_id: str
     status: SalesScriptStatus
     script: Optional[SalesScript] = None
+    # Kept in its own column rather than folded into `script` — see
+    # app/salescript/store.py. None for rows generated before this field
+    # existed; callers should treat that the same as archetype="other".
+    site_profile: Optional[SiteProfile] = None
     critique: Optional[SalesScriptCritique] = None
     revision_count: int = 0
     error: Optional[str] = None

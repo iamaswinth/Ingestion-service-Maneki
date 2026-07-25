@@ -111,6 +111,17 @@ def _classify_content_type(
         return "testimonial"
     if text.strip().startswith(('"', "“", ">")):
         return "testimonial"
+    # Non-commerce sites (portfolios, personal sites, agencies) lean heavily
+    # on these three section kinds — without them, most of a portfolio's
+    # content collapses into "generic". Checked after the more specific
+    # faq/pricing/testimonial branches above so existing marketing-site
+    # classification is unaffected.
+    if any(k in t for k in ("about", "bio", "who we are", "our story")):
+        return "about"
+    if any(k in t for k in ("contact", "get in touch", "book", "hire", "enquir", "inquir")):
+        return "contact"
+    if any(k in t for k in ("project", "work", "portfolio", "case study", "gallery", "selected")):
+        return "project"
     if is_first:
         return "hero"
     if any(k in t for k in ("feature", "how it works", "use case", "integration")):

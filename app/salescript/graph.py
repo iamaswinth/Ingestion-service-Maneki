@@ -1,10 +1,16 @@
 """The sales-script LangGraph agent.
 
     START --(Send fan-out, one per page)--> extract_facts_one x N (Haiku)
-        --(fan-in via `facts` reducer)--> derive_icp (Sonnet)
+        --(fan-in via `facts` reducer)--> profile_site (Sonnet)
         --> draft_script (Sonnet) <-------------------+
         --> critique (Sonnet) ---(revise, bounded)-----+
         --(finalize)--> END
+
+`profile_site` classifies what kind of site this is (SiteArchetype) before
+anything gets written — draft_script and critique resolve the matching
+app/salescript/playbooks.py entry and build their system prompts from it, so
+the script a portfolio gets is shaped differently from one a SaaS company
+gets, without changing the graph topology.
 
 Runs in-process (invoked from app/salescript/service.py via BackgroundTasks),
 not a separate LangGraph Server — see the plan doc for why. No checkpointer:
@@ -25,8 +31,8 @@ from langgraph.types import Send
 from langsmith import traceable
 
 from ..config import settings
-from ..models import IcpProfile, SalesScript, SalesScriptCritique
-from . import prompts
+from ..models import SalesScript, SalesScriptCritique, SiteProfile
+from . import playbooks, prompts
 
 _client: Optional[AsyncAnthropic] = None
 _extract_semaphore = asyncio.Semaphore(settings.sales_script_max_concurrent_extractions)
@@ -103,7 +109,7 @@ class SalesScriptState(TypedDict):
     site_url: str
     pages: list[dict]
     facts: Annotated[list[str], operator.add]
-    icp: Optional[dict]
+    profile: Optional[dict]
     script: Optional[dict]
     critique: Optional[dict]
     revision_count: int
@@ -135,24 +141,24 @@ async def extract_facts_one(payload: dict) -> dict:
     return {"facts": facts}
 
 
-@traceable(name="derive_icp_llm", run_type="llm")
-async def _call_derive_icp(facts: list[str]) -> str:
+@traceable(name="profile_site_llm", run_type="llm")
+async def _call_profile_site(facts: list[str]) -> str:
     return await _create_structured(
         model=settings.sales_script_model,
         max_tokens=3072,
-        system=prompts.DERIVE_ICP_SYSTEM_PROMPT,
-        schema=IcpProfile.model_json_schema(),
-        user_content=prompts.build_derive_icp_prompt(facts),
+        system=prompts.PROFILE_SITE_SYSTEM_PROMPT,
+        schema=SiteProfile.model_json_schema(),
+        user_content=prompts.build_profile_site_prompt(facts),
     )
 
 
-async def derive_icp(state: SalesScriptState) -> dict:
-    text = await _call_derive_icp(state["facts"])
-    return {"icp": json.loads(text)}
+async def profile_site(state: SalesScriptState) -> dict:
+    text = await _call_profile_site(state["facts"])
+    return {"profile": json.loads(text)}
 
 
 @traceable(name="draft_script_llm", run_type="llm")
-async def _call_draft_script(prompt: str) -> str:
+async def _call_draft_script(prompt: str, system: str) -> str:
     return await _create_structured(
         model=settings.sales_script_model,
         # SalesScript grew (proof_points, qualification_signals, staged
@@ -160,21 +166,23 @@ async def _call_draft_script(prompt: str) -> str:
         # 6144 was sized for the smaller pre-expansion schema and now
         # truncates mid-JSON on a normal-sized script, not just large sites.
         max_tokens=8192,
-        system=prompts.DRAFT_SCRIPT_SYSTEM_PROMPT,
+        system=system,
         schema=SalesScript.model_json_schema(),
         user_content=prompt,
     )
 
 
 async def draft_script(state: SalesScriptState) -> dict:
+    playbook = playbooks.get(state["profile"].get("archetype"))
     is_revision = state["critique"] is not None
     if is_revision:
         prompt = prompts.build_revise_prompt(
-            state["facts"], state["icp"], state["script"], state["critique"]
+            state["facts"], state["profile"], state["script"], state["critique"]
         )
     else:
-        prompt = prompts.build_draft_prompt(state["facts"], state["icp"])
-    text = await _call_draft_script(prompt)
+        prompt = prompts.build_draft_prompt(state["facts"], state["profile"])
+    system = prompts.build_draft_system_prompt(playbook, state["profile"])
+    text = await _call_draft_script(prompt, system)
     return {
         "script": json.loads(text),
         "revision_count": state["revision_count"] + (1 if is_revision else 0),
@@ -182,18 +190,20 @@ async def draft_script(state: SalesScriptState) -> dict:
 
 
 @traceable(name="critique_llm", run_type="llm")
-async def _call_critique(facts: list[str], script: dict) -> str:
+async def _call_critique(facts: list[str], script: dict, system: str) -> str:
     return await _create_structured(
         model=settings.sales_script_model,
         max_tokens=6144,
-        system=prompts.CRITIQUE_SYSTEM_PROMPT,
+        system=system,
         schema=SalesScriptCritique.model_json_schema(),
         user_content=prompts.build_critique_prompt(facts, script),
     )
 
 
 async def critique_node(state: SalesScriptState) -> dict:
-    text = await _call_critique(state["facts"], state["script"])
+    playbook = playbooks.get(state["profile"].get("archetype"))
+    system = prompts.build_critique_system_prompt(playbook)
+    text = await _call_critique(state["facts"], state["script"], system)
     return {"critique": json.loads(text)}
 
 
@@ -209,13 +219,13 @@ def _should_revise(state: SalesScriptState) -> Literal["revise", "finalize"]:
 def build_graph():
     builder = StateGraph(SalesScriptState)
     builder.add_node("extract_facts_one", extract_facts_one)
-    builder.add_node("derive_icp", derive_icp)
+    builder.add_node("profile_site", profile_site)
     builder.add_node("draft_script", draft_script)
     builder.add_node("critique", critique_node)
 
     builder.add_conditional_edges(START, _dispatch_extract, ["extract_facts_one"])
-    builder.add_edge("extract_facts_one", "derive_icp")
-    builder.add_edge("derive_icp", "draft_script")
+    builder.add_edge("extract_facts_one", "profile_site")
+    builder.add_edge("profile_site", "draft_script")
     builder.add_edge("draft_script", "critique")
     builder.add_conditional_edges(
         "critique", _should_revise, {"revise": "draft_script", "finalize": END}

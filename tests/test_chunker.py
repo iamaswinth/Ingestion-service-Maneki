@@ -119,6 +119,30 @@ def test_classify_content_type_feature_keyword():
     assert chunker._classify_content_type("Key Features", "Fast and reliable.") == "feature"
 
 
+def test_classify_content_type_about_keyword():
+    assert chunker._classify_content_type("About Me", "A bit of my background.") == "about"
+    assert chunker._classify_content_type("Our Story", "How we got started.") == "about"
+
+
+def test_classify_content_type_contact_keyword():
+    assert chunker._classify_content_type("Contact", "Reach out any time.") == "contact"
+    assert chunker._classify_content_type("Hire Me", "Let's work together.") == "contact"
+
+
+def test_classify_content_type_project_keyword():
+    assert chunker._classify_content_type("Selected Work", "Recent projects.") == "project"
+    assert chunker._classify_content_type("Portfolio", "A gallery of case studies.") == "project"
+
+
+def test_classify_content_type_pricing_and_faq_still_win_over_new_branches():
+    # The new about/contact/project branches sit after the existing
+    # faq/pricing/testimonial checks, so a section that matches both (e.g.
+    # a titled "Pricing" page with a dollar amount) still classifies as
+    # pricing, not generic-and-new.
+    assert chunker._classify_content_type("Pricing", "Plans start at $10/mo.") == "pricing"
+    assert chunker._classify_content_type("FAQ", "Some questions and answers.") == "faq"
+
+
 # ---- _split_long_text -------------------------------------------------------
 
 

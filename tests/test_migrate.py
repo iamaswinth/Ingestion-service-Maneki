@@ -214,7 +214,11 @@ class TestStatus:
 class TestRealBaseline:
     async def test_the_checked_in_baseline_applies_cleanly(self, scratch_schema):
         # Guards the actual shipped migrations, not just synthetic fixtures.
-        assert await apply_pending(scratch_schema) == ["0001_baseline", "0002_chunk_site_index"]
+        assert await apply_pending(scratch_schema) == [
+            "0001_baseline",
+            "0002_chunk_site_index",
+            "0003_sales_script_site_profile",
+        ]
         assert {"jobs", "pages", "chunks", "sales_scripts"} <= await _tables(scratch_schema)
 
     async def test_the_baseline_is_safe_on_a_database_that_already_has_the_tables(
@@ -227,4 +231,8 @@ class TestRealBaseline:
         await apply_pending(scratch_schema)
         await scratch_schema.execute("DROP TABLE schema_migrations")
 
-        assert await apply_pending(scratch_schema) == ["0001_baseline", "0002_chunk_site_index"]
+        assert await apply_pending(scratch_schema) == [
+            "0001_baseline",
+            "0002_chunk_site_index",
+            "0003_sales_script_site_profile",
+        ]
