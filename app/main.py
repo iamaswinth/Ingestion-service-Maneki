@@ -57,6 +57,20 @@ logger = logging.getLogger(__name__)
 
 _poll_task: asyncio.Task | None = None
 
+# asyncio.create_task() only keeps a *weak* reference to the task it returns
+# (see the asyncio docs' warning on create_task) — nothing else in
+# _poll_open_jobs holds the task it creates, so the event loop is free to
+# garbage-collect an in-flight ingest mid-run, leaving the job stuck at
+# ingest_status="ingesting" forever with no error recorded anywhere. Keeping
+# a strong reference here, discarded via the task's own done-callback once it
+# finishes, is the standard fix.
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _track(task: asyncio.Task) -> None:
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -114,11 +128,15 @@ async def _poll_open_jobs() -> None:
                 try:
                     state, should_ingest = await _advance_scrape(job.job_id)
                     if should_ingest:
-                        asyncio.create_task(_run_ingest(job.job_id))
+                        _track(asyncio.create_task(_run_ingest(job.job_id)))
                 except Exception:
-                    pass  # transient Firecrawl/DB error; retry next tick
+                    # Transient Firecrawl/DB error; retry next tick. Still
+                    # logged (previously a bare `pass`) — silent failure here
+                    # meant a job could sit stuck with nothing in any log
+                    # explaining why it never advanced.
+                    logger.exception("poll: failed to advance job_id=%s", job.job_id)
         except Exception:
-            pass
+            logger.exception("poll: failed to list open jobs")
         await asyncio.sleep(settings.scrape_poll_interval_seconds)
 
 

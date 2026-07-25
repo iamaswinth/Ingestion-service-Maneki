@@ -8,6 +8,8 @@ deterministic.
 
 import uuid
 
+import pytest
+
 from app import config as config_module
 from app.ingestion import questions
 from app.ingestion import store as ingestion_store
@@ -34,6 +36,7 @@ def _chunk(
     text: str,
     embedding_text: str | None = None,
     title: str | None = None,
+    section_id: str | None = None,
 ) -> Chunk:
     return Chunk(
         chunk_id=f"{tenant_id}-{suffix}",
@@ -41,6 +44,7 @@ def _chunk(
         job_id="test-job",
         site_url=site_url,
         page_url=site_url,
+        section_id=section_id,
         anchor_type="page",
         navigation=site_url,
         title=title,
@@ -236,3 +240,106 @@ async def test_rerank_promotes_the_real_semantic_match(pg_tenant):
     assert with_rerank[0].text == relevant_but_vector_disfavored.text
     assert with_rerank[0].rerank_score is not None
     assert with_rerank[0].rerank_score > with_rerank[1].rerank_score
+    # `score` (not just `rerank_score`) must reflect the rerank outcome: a
+    # consumer that sorts/thresholds on `score` alone (voice_runtime's
+    # _merge_hits and _hits_insufficient both do) needs to see the reranked
+    # order, not the pre-rerank RRF/cosine value the cross-encoder overrode.
+    # With only two candidates, min-max normalization pins them at the
+    # extremes: the promoted hit at 1.0, the demoted one at 0.0 -- see
+    # _normalize_rerank_scores for why this is min-max rather than a fixed
+    # sigmoid (measured against the real model, a fixed sigmoid put a
+    # genuinely relevant passage's score at ~0.003, permanently under
+    # voice_runtime's 0.35 threshold).
+    assert with_rerank[0].score == pytest.approx(1.0)
+    assert with_rerank[1].score == pytest.approx(0.0)
+
+
+async def test_rerank_score_matches_min_max_of_the_batch(pg_tenant):
+    tenant_id, site_url = pg_tenant
+    chunks = [
+        _chunk(
+            tenant_id=tenant_id, site_url=site_url, suffix=f"c{i}",
+            text=text,
+        )
+        for i, text in enumerate([
+            "We offer a full refund within 30 days of purchase.",
+            "Our headquarters are located in San Francisco.",
+            "Do you support single sign-on for enterprise customers?",
+        ])
+    ]
+    await ingestion_store.replace_site_chunks(
+        tenant_id, site_url, chunks, [_fake_vector(i) for i in range(len(chunks))]
+    )
+
+    hits = await ingestion_store.search(
+        tenant_id=tenant_id, embedding=_fake_vector(0), question="what is your refund policy",
+        top_k=3, hybrid=False, rerank=True, debug=True,
+    )
+
+    raw = [h.rerank_score for h in hits]
+    assert all(r is not None for r in raw)
+    lo, hi = min(raw), max(raw)
+    expected = [0.5 if hi == lo else (r - lo) / (hi - lo) for r in raw]
+    for hit, exp in zip(hits, expected):
+        assert hit.score == pytest.approx(exp)
+    # Monotonic: score must not contradict rerank_score's own ordering.
+    assert all(hits[i].score >= hits[i + 1].score for i in range(len(hits) - 1))
+
+
+async def test_rerank_score_is_neutral_on_a_tie(pg_tenant, monkeypatch):
+    # A degenerate batch where the cross-encoder can't discriminate (or a
+    # single-hit batch) must not read as maximal confidence (1.0) or zero
+    # confidence (0.0) -- 0.5 signals "no information" instead.
+    tenant_id, site_url = pg_tenant
+    chunk = _chunk(
+        tenant_id=tenant_id, site_url=site_url, suffix="only", text="Some content.",
+    )
+    await ingestion_store.replace_site_chunks(tenant_id, site_url, [chunk], [_fake_vector(0)])
+    monkeypatch.setattr(ingestion_store, "rerank_documents", lambda q, docs: [3.7 for _ in docs])
+
+    hits = await ingestion_store.search(
+        tenant_id=tenant_id, embedding=_fake_vector(0), question="anything",
+        top_k=1, hybrid=False, rerank=True, debug=True,
+    )
+
+    assert hits[0].score == pytest.approx(0.5)
+
+
+async def test_search_caps_hits_per_section(pg_tenant, monkeypatch):
+    """Ranking alone can hand back several near-duplicate hits from the same
+    (page_url, section_id) -- e.g. multiple sentences of the pricing block --
+    starving the agent of breadth and (since voice_runtime always navigates to
+    hits[0]) letting ranking alone pick where the visitor's browser goes. The
+    diversity cap should push extras from an already-full section behind at
+    least one hit from a distinct section instead of filling every slot with
+    one section's content.
+    """
+    tenant_id, site_url = pg_tenant
+    monkeypatch.setattr(config_module.settings, "max_hits_per_section", 1)
+
+    same_section = [
+        _chunk(
+            tenant_id=tenant_id, site_url=site_url, suffix=f"pricing-{i}",
+            text=f"Pricing detail sentence number {i} about our plans.",
+            section_id="pricing",
+        )
+        for i in range(3)
+    ]
+    other_section = _chunk(
+        tenant_id=tenant_id, site_url=site_url, suffix="faq",
+        text="Frequently asked question content about refunds.",
+        section_id="faq",
+    )
+
+    all_chunks = same_section + [other_section]
+    embeddings = [_fake_vector(i) for i in range(len(all_chunks))]
+    await ingestion_store.replace_site_chunks(tenant_id, site_url, all_chunks, embeddings)
+
+    hits = await ingestion_store.search(
+        tenant_id=tenant_id, embedding=_fake_vector(0), question="pricing plans",
+        top_k=2, hybrid=False, rerank=False,
+    )
+
+    assert len(hits) == 2
+    section_ids = [h.section_id for h in hits]
+    assert len(set(section_ids)) == 2, f"expected two distinct sections, got {section_ids}"

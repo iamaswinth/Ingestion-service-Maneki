@@ -95,8 +95,19 @@ async def get_status(job_id: str) -> dict:
 
 
 def to_pages(documents: list[Any]) -> list[Page]:
-    """Normalize Firecrawl documents into our Page model."""
-    pages: list[Page] = []
+    """Normalize Firecrawl documents into our Page model.
+
+    Deduped by URL, keeping the longest markdown per URL: Firecrawl can hand
+    back the same `sourceURL` twice in one crawl's document list (a redirect
+    followed to the same canonical page, an http/https or trailing-slash
+    variant that normalizes to the same URL on Firecrawl's side). Two Page
+    rows sharing one url produce identical chunk_ids downstream (chunker
+    hashes tenant|site_url|page_url|section_id|idx — url is the same for
+    both), so the second INSERT would violate the chunks primary key and
+    fail the whole ingest. Keeping the longest markdown also means a thin
+    redirect stub never wins over the real page it points to.
+    """
+    by_url: dict[str, Page] = {}
     for doc in documents:
         markdown = _get(doc, "markdown", default="") or ""
         html = _get(doc, "html", "raw_html", "rawHtml", default="") or ""
@@ -106,16 +117,18 @@ def to_pages(documents: list[Any]) -> list[Page]:
         description = _get(metadata, "description", "og_description", "ogDescription")
         if not markdown.strip():
             continue
-        pages.append(
-            Page(
-                url=str(url),
-                title=title,
-                description=description,
-                markdown=markdown,
-                sections=extract_sections(html),
-            )
+        url_str = str(url)
+        existing = by_url.get(url_str)
+        if existing is not None and len(existing.markdown) >= len(markdown):
+            continue
+        by_url[url_str] = Page(
+            url=url_str,
+            title=title,
+            description=description,
+            markdown=markdown,
+            sections=extract_sections(html),
         )
-    return pages
+    return list(by_url.values())
 
 
 async def map_site(url: str, limit: int) -> list[str]:

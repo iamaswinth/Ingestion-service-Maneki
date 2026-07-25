@@ -48,6 +48,10 @@ CREATE TABLE IF NOT EXISTS chunks (
 
 CREATE INDEX IF NOT EXISTS chunks_tenant_idx ON chunks (tenant_id);
 CREATE INDEX IF NOT EXISTS chunks_tenant_page_idx ON chunks (tenant_id, page_url);
+-- Every ingest's delete+replace (replace_site_chunks) and delete_site_chunks
+-- filter by exactly this pair; without it they ran against the tenant-only
+-- index above and rechecked every one of that tenant's rows against site_url.
+CREATE INDEX IF NOT EXISTS chunks_tenant_site_idx ON chunks (tenant_id, site_url);
 CREATE INDEX IF NOT EXISTS chunks_embedding_idx
   ON chunks USING hnsw (embedding vector_cosine_ops);
 
@@ -140,6 +144,29 @@ async def _insert_chunk_rows(conn: asyncpg.Connection, rows: list[tuple]) -> Non
                 kind, parent_chunk_id, question, embedding_text
             )
             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18)
+            -- Belt-and-braces: chunk_id is a content hash, so a residual
+            -- collision (two distinct logical chunks hashing the same id)
+            -- would otherwise violate the primary key and fail the whole
+            -- batch insert for this transaction, taking every other chunk in
+            -- it down too. Degrade to last-writer-wins instead.
+            ON CONFLICT (chunk_id) DO UPDATE SET
+                tenant_id = EXCLUDED.tenant_id,
+                job_id = EXCLUDED.job_id,
+                site_url = EXCLUDED.site_url,
+                page_url = EXCLUDED.page_url,
+                section_id = EXCLUDED.section_id,
+                parent_section_id = EXCLUDED.parent_section_id,
+                anchor_type = EXCLUDED.anchor_type,
+                navigation = EXCLUDED.navigation,
+                title = EXCLUDED.title,
+                content_type = EXCLUDED.content_type,
+                chunk_index = EXCLUDED.chunk_index,
+                text = EXCLUDED.text,
+                embedding = EXCLUDED.embedding,
+                kind = EXCLUDED.kind,
+                parent_chunk_id = EXCLUDED.parent_chunk_id,
+                question = EXCLUDED.question,
+                embedding_text = EXCLUDED.embedding_text
             """,
             rows,
         )
@@ -217,7 +244,10 @@ async def count_job_chunks(tenant_id: str, job_id: str) -> int:
 
 
 def _build_conditions(
-    tenant_id: str, site_url: Optional[str], page_url: Optional[str]
+    tenant_id: str,
+    site_url: Optional[str],
+    page_url: Optional[str],
+    include_questions: bool = True,
 ) -> tuple[list[str], list]:
     conditions = ["tenant_id = $1"]
     params: list = [tenant_id]
@@ -227,6 +257,11 @@ def _build_conditions(
     if page_url:
         params.append(page_url)
         conditions.append(f"page_url = ${len(params)}")
+    if not include_questions:
+        # No placeholder needed: 'question' is a fixed literal, not caller
+        # input. Lets scripts/eval_retrieval.py (and any future caller) A/B
+        # doc2query's contribution against a live tenant without a re-ingest.
+        conditions.append("kind != 'question'")
     return conditions, params
 
 
@@ -236,9 +271,10 @@ async def _search_vector_only(
     top_k: int,
     site_url: Optional[str],
     page_url: Optional[str],
+    include_questions: bool = True,
 ) -> list[QueryHit]:
     pool = await get_pool()
-    conditions, params = _build_conditions(tenant_id, site_url, page_url)
+    conditions, params = _build_conditions(tenant_id, site_url, page_url, include_questions)
 
     params.append(embedding)
     embedding_idx = len(params)
@@ -264,19 +300,28 @@ async def _search_vector_only(
             WHERE {' AND '.join(conditions)}
             ORDER BY embedding <=> ${embedding_idx}
             LIMIT ${candidate_idx}
-        )
-        SELECT text, page_url, section_id, title, content_type, anchor_type,
-               navigation, kind, question, score
-        FROM (
+        ),
+        ranked AS (
             SELECT *,
                    ROW_NUMBER() OVER (
                        PARTITION BY COALESCE(parent_chunk_id, chunk_id)
                        ORDER BY score DESC
                    ) AS rn
             FROM candidates
-        ) ranked
-        WHERE rn = 1
-        ORDER BY score DESC
+        )
+        -- Question rows carry no text of their own (see
+        -- questions.py::build_question_chunks) — when the winning row is a
+        -- question, its parent's real content is fetched via this join
+        -- instead. A no-op (COALESCE falls through to ranked.text) for
+        -- kind='content' rows, where parent_chunk_id is null.
+        SELECT COALESCE(parent.text, ranked.text) AS text, ranked.page_url,
+               ranked.section_id, ranked.title, ranked.content_type,
+               ranked.anchor_type, ranked.navigation, ranked.kind,
+               ranked.question, ranked.score
+        FROM ranked
+        LEFT JOIN chunks parent ON parent.chunk_id = ranked.parent_chunk_id
+        WHERE ranked.rn = 1
+        ORDER BY ranked.score DESC
         LIMIT ${top_k_idx}
     """
     async with pool.acquire() as conn:
@@ -334,6 +379,7 @@ async def _search_hybrid(
     site_url: Optional[str],
     page_url: Optional[str],
     debug: bool,
+    include_questions: bool = True,
 ) -> list[QueryHit]:
     """Vector + Postgres full-text, fused via Reciprocal Rank Fusion (RRF).
 
@@ -346,7 +392,7 @@ async def _search_hybrid(
     question (either leg) still collapses to one row.
     """
     pool = await get_pool()
-    conditions, params = _build_conditions(tenant_id, site_url, page_url)
+    conditions, params = _build_conditions(tenant_id, site_url, page_url, include_questions)
     where_clause = " AND ".join(conditions)
 
     params.append(question)
@@ -427,11 +473,17 @@ async def _search_hybrid(
                    ) AS rn
             FROM fused
         )
-        SELECT c.text, c.page_url, c.section_id, c.title, c.content_type,
-               c.anchor_type, c.navigation, c.kind, c.question,
-               r.rrf_score, r.vscore, r.lscore
+        -- Question rows carry no text of their own (see
+        -- questions.py::build_question_chunks); when the winning row is a
+        -- question, its parent's real content is fetched via this second
+        -- join. A no-op (COALESCE falls through to c.text) for kind='content'
+        -- rows, where parent_chunk_id is null.
+        SELECT COALESCE(parent.text, c.text) AS text, c.page_url, c.section_id,
+               c.title, c.content_type, c.anchor_type, c.navigation, c.kind,
+               c.question, r.rrf_score, r.vscore, r.lscore
         FROM ranked r
         JOIN chunks c ON c.chunk_id = r.chunk_id
+        LEFT JOIN chunks parent ON parent.chunk_id = c.parent_chunk_id
         WHERE r.rn = 1
         ORDER BY r.rrf_score DESC
         LIMIT ${top_k_idx}
@@ -461,10 +513,88 @@ async def _search_hybrid(
     ]
 
 
+def _normalize_rerank_scores(scores: list[float]) -> list[float]:
+    """Min-max the cross-encoder's raw logits onto 0..1 within this batch.
+
+    A plain sigmoid was tried first and measured against the real model this
+    app ships (Xenova/ms-marco-MiniLM-L-6-v2, see reranker.py): its logits run
+    far more negative than a sigmoid assumes — a clearly relevant one-sentence
+    passage scored -5.8, an irrelevant one -11.3. `sigmoid(-5.8) ≈ 0.003`, so a
+    fixed sigmoid would leave *every* reranked score under voice_runtime's 0.35
+    `_hits_insufficient` threshold regardless of relevance — worse than the bug
+    being fixed, since a great match would now always read as "thin". This
+    model's logits carry no absolute calibration this codebase can rely on
+    without ingesting real content and empirically tuning against it (exactly
+    the trap the sigmoid version fell into from a single hand-picked example).
+
+    Min-max over the batch actually being reranked guarantees what the
+    downstream re-sort needs — the top-ranked hit always scores highest — using
+    only relative information, no hardcoded constant. It has one known
+    limitation: if every candidate in the batch is equally irrelevant, the
+    "best of a bad set" still lands at 1.0, same as a genuinely great match
+    would. voice_runtime's 0.35 threshold was tuned against cosine/RRF scores,
+    not cross-encoder logits, so its accuracy against *this* scale is not
+    validated here — `debug=True`'s `rerank_score` field exists precisely so
+    that can be measured against real traffic rather than assumed.
+    """
+    if not scores:
+        return []
+    lo, hi = min(scores), max(scores)
+    spread = hi - lo
+    if spread <= 0:
+        # No signal to discriminate on (a single hit, or a genuine tie) —
+        # 0.5 reads as "no information", not the false confidence of 1.0 or
+        # the false alarm of 0.0.
+        return [0.5] * len(scores)
+    return [(s - lo) / spread for s in scores]
+
+
 async def _rerank_hits(question: str, hits: list[QueryHit], debug: bool) -> list[QueryHit]:
+    """Cross-encoder rerank. `score` is overwritten with the (batch-normalized)
+    rerank outcome — not left at its pre-rerank RRF/cosine value.
+
+    Previously `score` was never touched here at all (only `rerank_score` was,
+    and only under `debug`), so every consumer that sorts or thresholds on
+    `score` — voice_runtime's `_merge_hits` re-sorts on it, `_hits_insufficient`
+    thresholds it against 0.35 — silently saw the pre-rerank order. The
+    cross-encoder forward pass ran and changed nothing. See
+    `_normalize_rerank_scores` for why this is a min-max, not a sigmoid. The
+    raw logit survives in `rerank_score`, under `debug`, for tuning.
+    """
     scores = await asyncio.to_thread(rerank_documents, question, [h.text for h in hits])
-    ranked = sorted(zip(hits, scores), key=lambda pair: pair[1], reverse=True)
-    return [h.model_copy(update={"rerank_score": s}) if debug else h for h, s in ranked]
+    normalized = _normalize_rerank_scores(scores)
+    ranked = sorted(zip(hits, scores, normalized), key=lambda triple: triple[1], reverse=True)
+    return [
+        h.model_copy(update={"score": norm, **({"rerank_score": s} if debug else {})})
+        for h, s, norm in ranked
+    ]
+
+
+def _apply_section_diversity_cap(hits: list[QueryHit], max_per_section: int) -> list[QueryHit]:
+    """Cap hits from any one (page_url, section_id) at `max_per_section`.
+
+    Ranking alone can hand back top_k slices of a single section — five
+    different sentences of the pricing block for "what do you offer?" — which
+    both starves the agent of breadth and, since voice_runtime's
+    `_pick_navigation` always follows `hits[0]`, lets ranking alone decide
+    where the visitor's browser navigates. Over-full sections are pushed to
+    the back rather than dropped, so if the tenant's content genuinely has
+    fewer than top_k distinct sections, the slice below still fills out to
+    top_k instead of coming back short.
+    """
+    if max_per_section <= 0:
+        return hits
+    counts: dict[tuple[Optional[str], Optional[str]], int] = {}
+    kept: list[QueryHit] = []
+    overflow: list[QueryHit] = []
+    for hit in hits:
+        key = (hit.page_url, hit.section_id)
+        if counts.get(key, 0) < max_per_section:
+            counts[key] = counts.get(key, 0) + 1
+            kept.append(hit)
+        else:
+            overflow.append(hit)
+    return kept + overflow
 
 
 async def search(
@@ -477,32 +607,47 @@ async def search(
     hybrid: Optional[bool] = None,
     debug: bool = False,
     rerank: Optional[bool] = None,
+    include_questions: bool = True,
 ) -> list[QueryHit]:
     use_hybrid = settings.hybrid_search_enabled if hybrid is None else hybrid
     use_rerank = settings.rerank_enabled if rerank is None else rerank
+    apply_diversity_cap = settings.max_hits_per_section > 0
 
-    # Fetch more than top_k when reranking so the cross-encoder has real
-    # room to promote a good match that RRF/cosine ranked lower — the final
-    # top_k slice happens only after reranking, below.
+    # Fetch more than top_k whenever something downstream needs headroom to
+    # reorder or filter within the candidate set: reranking needs room for the
+    # cross-encoder to promote a match RRF/cosine ranked lower, and the
+    # per-section diversity cap below needs overflow candidates to draw from
+    # instead of already being handed exactly top_k rows (which, pre-cap,
+    # could all be one section). Both share the same oversample knobs — no
+    # need for a second multiplier/ceiling pair for what is the same "give the
+    # next step real candidates to work with" need.
     fetch_k = top_k
-    if use_rerank:
+    if use_rerank or apply_diversity_cap:
         fetch_k = max(
             top_k,
             min(top_k * settings.rerank_candidate_multiplier, settings.rerank_candidate_ceiling),
         )
 
     if not use_hybrid:
-        hits = await _search_vector_only(tenant_id, embedding, fetch_k, site_url, page_url)
+        hits = await _search_vector_only(
+            tenant_id, embedding, fetch_k, site_url, page_url, include_questions
+        )
     else:
         try:
             hits = await _search_hybrid(
-                tenant_id, embedding, question, fetch_k, site_url, page_url, debug
+                tenant_id, embedding, question, fetch_k, site_url, page_url, debug,
+                include_questions,
             )
         except Exception:
             logger.exception("Hybrid search failed; falling back to vector-only")
-            hits = await _search_vector_only(tenant_id, embedding, fetch_k, site_url, page_url)
+            hits = await _search_vector_only(
+                tenant_id, embedding, fetch_k, site_url, page_url, include_questions
+            )
 
     if use_rerank and hits:
         hits = await _rerank_hits(question, hits, debug)
+
+    if apply_diversity_cap:
+        hits = _apply_section_diversity_cap(hits, settings.max_hits_per_section)
 
     return hits[:top_k]

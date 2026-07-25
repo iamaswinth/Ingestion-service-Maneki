@@ -4,7 +4,8 @@ import asyncio
 import logging
 
 from .. import storage
-from ..models import Page, PageSummary
+from ..config import settings
+from ..models import Chunk, Page, PageSummary
 from . import store
 from .chunker import chunk_page
 from .embedder import embed_documents
@@ -17,9 +18,41 @@ def _to_page(summary: PageSummary) -> Page:
     return Page(
         url=summary.url,
         title=summary.title,
+        description=summary.description,
         markdown=summary.markdown or "",
         sections=summary.sections or [],
     )
+
+
+def _dedupe_chunks(chunks: list[Chunk]) -> list[Chunk]:
+    """Drop chunks whose normalized text exactly duplicates one already kept.
+
+    `only_main_content` strips headers/footers, but in-content boilerplate
+    (repeated CTAs, cookie/consent copy, a feature strip reused on every
+    page) still survives and gets chunked once per page it appears on.
+    Untreated, identical text competes with itself for /query's top_k slots
+    and doc2query pays LLM tokens to write near-identical questions for the
+    same passage N times.
+
+    Keeps the first occurrence in crawl order (page list order is Firecrawl's
+    crawl order, so the canonical/earliest-discovered page wins) and drops
+    later duplicates. Whitespace-and-case normalized so "Book a Demo" and
+    "book a demo\\n" collapse to the same key without touching the kept
+    chunk's actual text.
+    """
+    seen: set[str] = set()
+    kept: list[Chunk] = []
+    dropped = 0
+    for chunk in chunks:
+        key = " ".join(chunk.text.split()).lower()
+        if key in seen:
+            dropped += 1
+            continue
+        seen.add(key)
+        kept.append(chunk)
+    if dropped:
+        logger.info("dropped %d duplicate-text chunks", dropped)
+    return kept
 
 
 async def ingest_job(job_id: str) -> tuple[int, int]:
@@ -55,6 +88,8 @@ async def ingest_job(job_id: str) -> tuple[int, int]:
             _to_page(summary), job_id=job_id, tenant_id=job.tenant_id, site_url=job.url
         )
     ]
+    if settings.dedupe_chunks:
+        content_chunks = _dedupe_chunks(content_chunks)
     if not content_chunks:
         await store.delete_site_chunks(job.tenant_id, job.url)
         logger.warning(

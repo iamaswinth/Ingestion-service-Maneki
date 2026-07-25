@@ -162,17 +162,37 @@ def test_split_long_text_hard_cut_when_no_delimiter_found():
     assert parts[0] == "a" * 1000
 
 
-# ---- _make_chunk_id determinism ---------------------------------------------
+# ---- make_chunk_id determinism + site_url isolation -------------------------
 
 
 def test_make_chunk_id_is_deterministic_sha256():
-    cid = chunker._make_chunk_id("tenant1", "https://x.com/p", "pricing", 0)
+    cid = chunker.make_chunk_id("tenant1", "https://x.com/", "https://x.com/p", "pricing", "0")
     expected = hashlib.sha256(
-        "tenant1|https://x.com/p|pricing|0".encode("utf-8")
+        "tenant1|https://x.com/|https://x.com/p|pricing|0".encode("utf-8")
     ).hexdigest()[:16]
     assert cid == expected
-    assert chunker._make_chunk_id("tenant1", "https://x.com/p", "pricing", 0) == cid
-    assert chunker._make_chunk_id("tenant1", "https://x.com/p", "pricing", 1) != cid
+    assert (
+        chunker.make_chunk_id("tenant1", "https://x.com/", "https://x.com/p", "pricing", "0")
+        == cid
+    )
+    assert (
+        chunker.make_chunk_id("tenant1", "https://x.com/", "https://x.com/p", "pricing", "1")
+        != cid
+    )
+
+
+def test_make_chunk_id_differs_across_site_url():
+    # Same tenant, same page_url, two different crawl seeds (site_url) for
+    # that tenant -- e.g. a re-crawl started from "https://x.com/" vs.
+    # "https://x.com/docs" that both happen to reach "https://x.com/p". These
+    # must not collide: replace_site_chunks deletes by (tenant_id, site_url),
+    # so a shared chunk_id would mean the delete for one site_url can never
+    # remove the other's row, and the next insert dies on the chunk_id
+    # primary key -- failing the whole ingest (see chunker.make_chunk_id's
+    # docstring).
+    a = chunker.make_chunk_id("tenant1", "https://x.com/", "https://x.com/p", "pricing", "0")
+    b = chunker.make_chunk_id("tenant1", "https://x.com/docs", "https://x.com/p", "pricing", "0")
+    assert a != b
 
 
 # ---- _page_has_usable_sections dominance-threshold boundary -----------------
@@ -292,6 +312,67 @@ def test_parent_section_id_is_immediate_parent_only():
 
 
 # ---- chunk_min_chars: per-piece filtering + index renumbering ---------------
+
+
+# ---- undersized nested sections roll up instead of vanishing ----------------
+
+
+def test_undersized_faq_sections_roll_up_into_parent():
+    """Real FAQ markup is one id per question and one per answer, each a
+    single short sentence -- shorter than chunk_min_chars (40) on its own,
+    but also stripped out of its parent's own markdown by
+    app/sections.py::extract_sections (parent and child never duplicate
+    text). Before the roll-up fix, a section in that gap landed in *no*
+    chunk at all: too big to keep in the parent, too small to stand alone.
+    This reproduces that shape and asserts every question and answer still
+    reaches some chunk.
+    """
+    faq_q1 = Section(id="faq-q-1", tag="div", title="Do you support HIPAA?",
+                      chars=25, markdown="### Do you support HIPAA?")
+    faq_a1 = Section(id="faq-a-1", tag="div", title="Faq A 1",
+                      chars=28, markdown="Yes, we are HIPAA compliant.")
+    faq_q2 = Section(id="faq-q-2", tag="div", title="Can I cancel anytime?",
+                      chars=25, markdown="### Can I cancel anytime?")
+    faq_a2 = Section(id="faq-a-2", tag="div", title="Faq A 2",
+                      chars=29, markdown="Yes. Cancel anytime, no fees.")
+    faq = Section(
+        id="faq", tag="section", title="FAQ", chars=29,
+        markdown="## Frequently Asked Questions",
+        children=[faq_q1, faq_a1, faq_q2, faq_a2],
+    )
+    page = Page(
+        url="https://x.com/",
+        title="X",
+        markdown="# FAQ\n\nDo you support HIPAA?\n\nYes, we are HIPAA compliant.\n\n"
+        "Can I cancel anytime?\n\nYes. Cancel anytime, no fees.",
+        sections=[faq],
+    )
+
+    chunks = chunker.chunk_page(page, job_id="j", tenant_id="t", site_url="https://x.com/")
+
+    all_text = " ".join(c.text for c in chunks)
+    assert "HIPAA compliant" in all_text
+    assert "no fees" in all_text
+    # None of the four undersized children got their own chunk_min_chars-
+    # violating chunk -- they were absorbed into the "faq" parent instead.
+    assert all(len(c.text) >= 40 for c in chunks)
+
+
+def test_child_that_clears_the_floor_still_gets_its_own_chunk():
+    # A nested section with real substance (>= chunk_min_chars on its own)
+    # must NOT be swept into its parent -- only genuinely-too-small content
+    # gets rolled up.
+    child_md = "This child section has plenty of its own real content here."
+    child = Section(id="pricing-detail", tag="div", title="Detail", chars=len(child_md), markdown=child_md)
+    parent = Section(id="pricing", tag="section", title="Pricing", chars=10, markdown="Pricing", children=[child])
+    page = Page(url="https://x.com/", markdown="Pricing\n\n" + child_md, sections=[parent])
+
+    chunks = chunker.chunk_page(page, job_id="j", tenant_id="t", site_url="https://x.com/")
+
+    by_id = {c.section_id: c for c in chunks}
+    assert "pricing-detail" in by_id
+    assert by_id["pricing-detail"].text == child_md
+    assert by_id["pricing-detail"].parent_section_id == "pricing"
 
 
 def test_chunk_min_chars_filters_pieces_and_renumbers_index(monkeypatch):

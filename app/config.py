@@ -62,15 +62,29 @@ class Settings(BaseSettings):
     chunk_overlap_chars: int = 150
     chunk_min_chars: int = 40
 
+    # Drop chunks whose normalized text exactly duplicates one already kept for
+    # this (tenant_id, site_url) — repeated CTA/cookie/footer-in-content blocks
+    # that only_main_content doesn't strip. Off switch for a site that
+    # legitimately needs identical text indexed under multiple nav targets.
+    dedupe_chunks: bool = True
+
     # --- Doc2query: AI-generated questions per chunk (app/ingestion/questions.py) ---
     # Anthropic API key. Empty => question generation is silently skipped and
     # the pipeline behaves exactly as before (pure dense retrieval).
     anthropic_api_key: str = ""
     question_gen_enabled: bool = True
     question_gen_model: str = "claude-haiku-4-5"
-    questions_per_chunk: int = 3
+    # 3->2: diminishing returns per extra question, and fewer question rows
+    # per chunk directly relieves the hnsw.ef_search dilution below (each
+    # doc2query row is a distinct HNSW candidate competing with real content
+    # for the same fixed ef_search budget).
+    questions_per_chunk: int = 2
     # How many chunks to pack into one LLM request.
     question_gen_batch_size: int = 12
+    # Anthropic SDK default is 600s; a stalled batch shouldn't hold an ingest
+    # hostage for ten minutes. Fail-open design (see questions.py) means a
+    # timeout here just means fewer questions, never a failed ingest.
+    question_gen_timeout_seconds: float = 60.0
 
     # --- Hybrid retrieval: dense vector + Postgres full-text, fused via RRF ---
     hybrid_search_enabled: bool = True
@@ -92,6 +106,25 @@ class Settings(BaseSettings):
     # balloon rerank cost).
     rerank_candidate_multiplier: int = 4
     rerank_candidate_ceiling: int = 50
+
+    # Max hits from any one (page_url, section_id) in a /query response. Ranking
+    # alone can return top_k slices of a single section (e.g. five different
+    # sentences of the pricing block); this caps that so the agent sees breadth
+    # across the tenant's content instead. Applied after reranking.
+    max_hits_per_section: int = 2
+
+    # HNSW query-time recall knob (app/db.py). pgvector's index default
+    # (ef_search=40) is fixed regardless of how many candidates a query asks
+    # for, and is a *global* scan budget before any per-tenant WHERE filter is
+    # applied — once the chunks table holds several tenants, a small tenant's
+    # rows can fall outside the top-40 nearest globally and searches return
+    # too few (or zero) hits despite the tenant's data being present and
+    # correct. Set above the largest candidate pool a single query can request
+    # end to end (top_k=20 with reranking -> fetch_k=50 -> hybrid candidate_n
+    # up to 400) so the tenant filter has real room to be satisfied even at
+    # the extreme end of the request range; ef_search only costs query
+    # latency, not storage.
+    hnsw_ef_search: int = 400
 
     # --- Sales script generation (app/salescript/) ---
     # An explicit, user-triggered action (unlike doc2query's silent fail-open)

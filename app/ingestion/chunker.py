@@ -89,6 +89,13 @@ def _make_anchor(page_url: str, section_id: Optional[str], text: str) -> tuple[s
     return "page", page_url
 
 
+# A bare "$" fires on code samples (`$ npm install`), shell prompts, and any
+# page that mentions a currency symbol in passing. Require an actual amount —
+# a currency symbol immediately followed by a digit — before calling a chunk
+# "pricing" on text evidence alone.
+_PRICE_AMOUNT_RE = re.compile(r"[$€£¥]\s?\d")
+
+
 def _classify_content_type(
     title: Optional[str], text: str, is_first: bool = False
 ) -> ContentType:
@@ -98,7 +105,7 @@ def _classify_content_type(
     question_lines = sum(1 for line in text.splitlines() if line.strip().endswith("?"))
     if question_lines >= 2:
         return "faq"
-    if "pricing" in t or "price" in t or "$" in text:
+    if "pricing" in t or "price" in t or _PRICE_AMOUNT_RE.search(text):
         return "pricing"
     if "testimonial" in t or "review" in t:
         return "testimonial"
@@ -140,8 +147,21 @@ def _split_long_text(text: str, target: int, max_chars: int, overlap: int) -> li
     return [p for p in parts if p]
 
 
-def _make_chunk_id(tenant_id: str, page_url: str, section_id: Optional[str], idx: int) -> str:
-    raw = f"{tenant_id}|{page_url}|{section_id or ''}|{idx}"
+def make_chunk_id(
+    tenant_id: str, site_url: str, page_url: str, section_id: Optional[str], suffix: str
+) -> str:
+    """Deterministic id for a chunk.
+
+    `site_url` is part of the key, not just `page_url`: chunks are replaced by
+    (tenant_id, site_url) (see store.replace_site_chunks), so two crawls of the
+    same tenant seeded at different URLs — "https://acme.com/" and
+    "https://acme.com/docs", or an http/https or www/apex variant of one site —
+    are two independent chunk sets. Without site_url in the hash, any page
+    reachable from both seeds produces the same chunk_id under two site_urls,
+    the delete for one never removes the other's rows, and the INSERT dies on
+    the chunk_id primary key, failing the whole ingest.
+    """
+    raw = f"{tenant_id}|{site_url}|{page_url}|{section_id or ''}|{suffix}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 
 
@@ -149,6 +169,52 @@ def _walk_sections(sections: list[Section], parent_id: Optional[str] = None):
     for sec in sections:
         yield sec, parent_id
         yield from _walk_sections(sec.children, sec.id)
+
+
+def _resolve_section(
+    sec: Section,
+) -> tuple[str, list[tuple[Section, Optional[str], str]]]:
+    """Post-order walk returning (text_for_this_section, standalone_descendants).
+
+    `app/sections.py` strips every nested id'd child out of its parent's own
+    markdown, so parent and child never duplicate text. That pairs badly with a
+    flat `len(cleaned) < chunk_min_chars: continue` filter: a child whose text
+    sits between sections.py's `_MIN_TEXT_CHARS` (20) and `chunk_min_chars` (40)
+    is removed from its parent *and* rejected on its own, so it lands in no
+    chunk at all. Real FAQ markup is exactly that shape — one id per question
+    and one per answer, each a single short sentence — which silently dropped a
+    site's entire FAQ, the highest-value content a sales agent has.
+
+    So instead of dropping an undersized section, roll its text up into the
+    nearest ancestor big enough to stand alone. A section that already clears
+    the floor is emitted on its own and keeps its own id anchor; only content
+    that could never have been a chunk gets merged upward.
+    """
+    parts = [clean_text(sec.markdown)]
+    standalone: list[tuple[Section, Optional[str], str]] = []
+    for child in sec.children:
+        child_text, child_standalone = _resolve_section(child)
+        if len(child_text) >= settings.chunk_min_chars:
+            standalone.append((child, sec.id, child_text))
+        elif child_text:
+            parts.append(child_text)
+        # A grandchild that stands on its own does so regardless of whether its
+        # own parent was absorbed — its text is already excluded from
+        # `child_text`, so this never duplicates content.
+        standalone.extend(child_standalone)
+    return "\n\n".join(p for p in parts if p), standalone
+
+
+def _resolve_sections(page: Page) -> list[tuple[Section, Optional[str], str]]:
+    """Every section that carries enough content to be its own chunk, in
+    document order, paired with its parent id and rolled-up text."""
+    resolved: list[tuple[Section, Optional[str], str]] = []
+    for sec in page.sections:
+        text, standalone = _resolve_section(sec)
+        if len(text) >= settings.chunk_min_chars:
+            resolved.append((sec, None, text))
+        resolved.extend(standalone)
+    return resolved
 
 
 def _page_has_usable_sections(page: Page) -> bool:
@@ -186,9 +252,16 @@ def _build_chunk(
 ) -> Chunk:
     anchor_type, navigation = _make_anchor(page.url, section_id, text)
     content_type = _classify_content_type(title, text, is_first=is_first)
-    embedding_text = f"{page.title or ''} — {title or ''}: {text}".strip(" —:")
+    # The page's meta description is usually the crispest one-line statement of
+    # what the site sells, and it is the only page-level context the first chunk
+    # can carry. Fold it into the first chunk's embedded/lexically-searched text
+    # (never into `text`, which is what gets spoken).
+    prefix = f"{page.title or ''} — {title or ''}"
+    if is_first and page.description:
+        prefix = f"{prefix} — {page.description}"
+    embedding_text = f"{prefix}: {text}".strip(" —:")
     return Chunk(
-        chunk_id=_make_chunk_id(tenant_id, page.url, section_id, idx),
+        chunk_id=make_chunk_id(tenant_id, site_url, page.url, section_id, str(idx)),
         tenant_id=tenant_id,
         job_id=job_id,
         site_url=site_url,
@@ -207,10 +280,7 @@ def _build_chunk(
 
 def _chunks_from_sections(page: Page, job_id: str, tenant_id: str, site_url: str) -> list[Chunk]:
     chunks: list[Chunk] = []
-    for sec, parent_id in _walk_sections(page.sections):
-        cleaned = clean_text(sec.markdown)
-        if len(cleaned) < settings.chunk_min_chars:
-            continue
+    for sec, parent_id, cleaned in _resolve_sections(page):
         pieces = _split_long_text(
             cleaned,
             settings.chunk_target_chars,
@@ -238,6 +308,13 @@ def _chunks_from_sections(page: Page, job_id: str, tenant_id: str, site_url: str
                     title=sec.title,
                     text=piece,
                     idx=idx,
+                    # `is_first` was previously only ever passed on the
+                    # flat-markdown path, so a page with real HTML sections —
+                    # the common, well-structured case — could never produce a
+                    # "hero" chunk. The voice agent uses content_type to pick an
+                    # opening line, so that asymmetry made the good markup the
+                    # worse experience.
+                    is_first=not chunks,
                 )
             )
             idx += 1

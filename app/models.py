@@ -103,6 +103,7 @@ class Page(BaseModel):
 class PageSummary(BaseModel):
     url: str
     title: Optional[str] = None
+    description: Optional[str] = None
     chars: int
     section_count: int = 0
     markdown: Optional[str] = None  # populated only when include_content=true

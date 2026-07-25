@@ -12,7 +12,6 @@ are the source of truth; questions are an enhancement.
 """
 
 import asyncio
-import hashlib
 import json
 import logging
 from typing import Optional
@@ -21,6 +20,7 @@ from anthropic import AsyncAnthropic
 
 from ..config import settings
 from ..models import Chunk
+from .chunker import make_chunk_id
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +71,15 @@ def enabled() -> bool:
 def _get_client() -> AsyncAnthropic:
     global _client
     if _client is None:
-        _client = AsyncAnthropic(api_key=settings.anthropic_api_key)
+        # Explicit timeout: the SDK default is 600s, and a single stalled
+        # batch shouldn't be able to hold an ingest hostage for ten minutes.
+        # Safe to keep short — this whole module is fail-open (see the module
+        # docstring), so a timeout just means fewer synthetic questions for
+        # this batch, never a failed ingest.
+        _client = AsyncAnthropic(
+            api_key=settings.anthropic_api_key,
+            timeout=settings.question_gen_timeout_seconds,
+        )
     return _client
 
 
@@ -151,18 +159,30 @@ async def generate_questions(chunks: list[Chunk]) -> dict[str, list[str]]:
 def build_question_chunks(
     chunks: list[Chunk], questions: dict[str, list[str]]
 ) -> list[Chunk]:
-    """Create question rows: copies of the parent that embed the question text."""
+    """Create question rows: copies of the parent that embed the question text.
+
+    `text` is blanked (not copied from the parent): a hit on a question row
+    returns the parent's *own* text via a join at query time (see
+    app/ingestion/store.py's parent-text COALESCE in both search paths), not a
+    second stored copy of it. At questions_per_chunk=2 that alone was doubling
+    the chunks table's largest column, the row count, and the HNSW index size
+    for content the row never actually needs — the join costs one indexed
+    lookup on the (already-visited) winning row, not a wider table scan.
+    """
     out: list[Chunk] = []
     for parent in chunks:
         for i, question in enumerate(questions.get(parent.chunk_id, [])):
-            raw = f"{parent.tenant_id}|{parent.page_url}|{parent.section_id or ''}|{parent.chunk_index}|q{i}"
             out.append(
                 parent.model_copy(
                     update={
-                        "chunk_id": hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16],
+                        "chunk_id": make_chunk_id(
+                            parent.tenant_id, parent.site_url, parent.page_url,
+                            parent.section_id, f"{parent.chunk_index}|q{i}",
+                        ),
                         "kind": "question",
                         "parent_chunk_id": parent.chunk_id,
                         "question": question,
+                        "text": "",
                         "embedding_text": question,
                     }
                 )

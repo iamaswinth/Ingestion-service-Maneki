@@ -234,6 +234,7 @@ async def persist_pages(job_id: str, pages: list[Page]) -> list[PageSummary]:
             PageSummary(
                 url=page.url,
                 title=page.title,
+                description=page.description,
                 chars=chars,
                 section_count=len(page.sections),
             )
@@ -260,7 +261,11 @@ async def load_pages(job_id: str, include_content: bool = False) -> JobPages | N
     if job_row is None:
         return None
 
-    cols = "url, title, chars, section_count"
+    # description is small (like title) so it's always selected, not gated
+    # behind include_content like markdown/sections — the ingestion path
+    # (include_content=True) needs it on Page to fold into the first chunk's
+    # embedding_text (see ingestion/service.py::_to_page).
+    cols = "url, title, description, chars, section_count"
     if include_content:
         cols += ", markdown, sections"
     rows = await pool.fetch(
@@ -272,6 +277,7 @@ async def load_pages(job_id: str, include_content: bool = False) -> JobPages | N
         summary = PageSummary(
             url=row["url"],
             title=row["title"],
+            description=row["description"],
             chars=row["chars"],
             section_count=row["section_count"],
         )

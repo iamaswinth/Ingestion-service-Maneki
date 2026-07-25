@@ -9,6 +9,12 @@ name or term lookups -- the case hybrid retrieval is meant to fix),
 "ambiguous" (broad questions where dense retrieval alone should already do
 fine -- used as a regression check that hybrid doesn't make things worse).
 
+A third mode, "hybrid_no_doc2query", runs hybrid search with the synthetic
+doc2query question vectors excluded (search(include_questions=False)) against
+the *same* ingested chunks -- no re-ingest required. Compare it against
+"hybrid" to see whether doc2query is actually moving hit@1/hit@k for this
+tenant, rather than assuming it.
+
 Copy scripts/eval_queries.example.json, point `tenant_id` at a tenant you've
 actually ingested, and fill in queries/expected_page_url pairs for that site
 before running this for real numbers.
@@ -40,13 +46,19 @@ async def _run(queries_path: Path, top_k: int) -> None:
         bucket = item["bucket"]
         embedding = await asyncio.to_thread(embed_query, question)
 
-        for mode, hybrid in (("vector_only", False), ("hybrid", True)):
+        modes = (
+            ("vector_only", False, True),
+            ("hybrid", True, True),
+            ("hybrid_no_doc2query", True, False),
+        )
+        for mode, hybrid, include_questions in modes:
             hits = await ingestion_store.search(
                 tenant_id=tenant_id,
                 embedding=embedding,
                 question=question,
                 top_k=top_k,
                 hybrid=hybrid,
+                include_questions=include_questions,
             )
             page_urls = [h.page_url for h in hits]
             hit_at_1 = bool(page_urls) and page_urls[0] == expected
