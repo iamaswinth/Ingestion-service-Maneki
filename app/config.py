@@ -136,6 +136,30 @@ class Settings(BaseSettings):
     sales_script_max_page_chars: int = 8000
     sales_script_page_batch_size: int = 1
     sales_script_max_concurrent_extractions: int = 4
+    # Lowered from an earlier 6: the SDK's backoff is min(0.5 * 2**n, 8s), so
+    # retries past ~4 buy only 8s each — a poor way to wait out a multi-minute
+    # capacity event. Patience now lives in graph.py's node-level RetryPolicy
+    # (_LLM_RETRY), whose intervals can be much longer and, unlike the SDK's
+    # DEBUG-level retries, are logged at INFO and visible in LangSmith. This
+    # multiplies with RetryPolicy.max_attempts (4 x 3 = 12 HTTP attempts/stage),
+    # so don't raise both independently.
+    sales_script_anthropic_max_retries: int = 3
+    # Per-attempt HTTP timeout. The SDK default is 600s, which at even a modest
+    # retry count is tens of minutes for one stage — past _STALE_GENERATION
+    # (store.py, 30 min), after which a second worker can claim the same row.
+    # Sized above a non-streaming 8192-token Sonnet generation (draft_script),
+    # unlike questions.py's 60s, which would false-positive on a large draft.
+    sales_script_timeout_seconds: float = 240.0
+    # Hard ceiling on one whole generation run, enforced in
+    # service.py::run_generation via asyncio.wait_for. Must stay comfortably
+    # below store._STALE_GENERATION (30 min) so a slow worker can never
+    # outlive its own claim and race a re-claimed second worker on the same row.
+    sales_script_run_timeout_seconds: float = 1500.0
+    # Floor for graph.py's fail-open fact extraction (extract_facts_one):
+    # fraction of pages that must extract successfully before profile_site
+    # will proceed. Below this the run fails loudly rather than writing a
+    # confident script from the few facts that survived.
+    sales_script_min_extract_success_ratio: float = 0.5
 
     # LangSmith tracing for the sales-script graph. Read as our own settings
     # (not left to pydantic-settings' env_file loading, which never mutates

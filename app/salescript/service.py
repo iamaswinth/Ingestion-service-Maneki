@@ -15,6 +15,7 @@ from ..ingestion.embedder import embed_documents
 from ..models import SalesScriptRecord
 from . import playbooks, sectioning, store
 from .chunker import sales_script_to_chunks
+from .errors import describe_failure
 from .graph import graph
 
 logger = logging.getLogger(__name__)
@@ -43,19 +44,27 @@ async def run_generation(tenant_id: str, site_url: str, job_id: str) -> None:
         if not pages:
             raise ValueError("No page content available to extract facts from")
 
-        final_state = await graph.ainvoke(
-            {
-                "tenant_id": tenant_id,
-                "job_id": job_id,
-                "site_url": site_url,
-                "pages": pages,
-                "facts": [],
-                "profile": None,
-                "script": None,
-                "critique": None,
-                "revision_count": 0,
-                "max_revisions": settings.sales_script_max_revisions,
-            }
+        final_state = await asyncio.wait_for(
+            graph.ainvoke(
+                {
+                    "tenant_id": tenant_id,
+                    "job_id": job_id,
+                    "site_url": site_url,
+                    "pages": pages,
+                    "facts": [],
+                    "extract_failures": 0,
+                    "extract_errors": [],
+                    "profile": None,
+                    "script": None,
+                    "critique": None,
+                    "revision_count": 0,
+                    "max_revisions": settings.sales_script_max_revisions,
+                }
+            ),
+            # Must stay under store._STALE_GENERATION (30 min): an untimed run
+            # that outlives its own claim lets a retry spawn a second worker
+            # that races this one on save_result/save_failure for the same row.
+            timeout=settings.sales_script_run_timeout_seconds,
         )
         await store.save_result(
             tenant_id,
@@ -71,7 +80,7 @@ async def run_generation(tenant_id: str, site_url: str, job_id: str) -> None:
             tenant_id,
             site_url,
         )
-        await store.save_failure(tenant_id, site_url, str(exc))
+        await store.save_failure(tenant_id, site_url, describe_failure(exc))
 
 
 async def approve_and_index(
