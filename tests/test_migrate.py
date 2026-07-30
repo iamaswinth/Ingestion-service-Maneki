@@ -218,6 +218,7 @@ class TestRealBaseline:
             "0001_baseline",
             "0002_chunk_site_index",
             "0003_sales_script_site_profile",
+            "0004_page_links",
         ]
         assert {"jobs", "pages", "chunks", "sales_scripts"} <= await _tables(scratch_schema)
 
@@ -235,4 +236,5 @@ class TestRealBaseline:
             "0001_baseline",
             "0002_chunk_site_index",
             "0003_sales_script_site_profile",
+            "0004_page_links",
         ]

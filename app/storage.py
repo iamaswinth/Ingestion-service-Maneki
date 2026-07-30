@@ -14,7 +14,8 @@ scraping->persisted transition can be claimed atomically across all of them
 import asyncpg
 
 from . import db, schema_guard
-from .models import JobPages, JobState, Page, PageSummary, Section
+from .links import page_key
+from .models import JobPages, JobState, Page, PageLink, PageLinksRecord, PageSummary, Section
 
 _schema_ready = False
 
@@ -50,12 +51,22 @@ CREATE TABLE IF NOT EXISTS pages (
   chars          INT NOT NULL,
   section_count  INT NOT NULL DEFAULT 0,
   sections       JSONB,
+  links          JSONB,
+  url_key        TEXT,
   created_at     timestamptz NOT NULL DEFAULT now(),
   PRIMARY KEY (job_id, page_index)
 );
 
 CREATE INDEX IF NOT EXISTS pages_job_idx ON pages (job_id);
+CREATE INDEX IF NOT EXISTS pages_url_key_idx ON pages (url_key);
 """
+# `links`/`url_key` land in a fresh dev DB via the CREATE TABLE above. An
+# existing database (one that already had `pages` before this change) only
+# gets them via migrations/0004_page_links.sql — CREATE TABLE IF NOT EXISTS
+# is a silent no-op against a table that already exists, and
+# schema_guard.verify_tables only checks the table itself, never columns. Per
+# CLAUDE.md, new schema changes belong in a new migration file, not as an
+# ALTER appended here — run `python -m app.migrate` on an existing local DB.
 
 
 async def _pool() -> asyncpg.Pool:
@@ -217,6 +228,7 @@ async def persist_pages(job_id: str, pages: list[Page]) -> list[PageSummary]:
         sections_payload = (
             [s.model_dump() for s in page.sections] if page.sections else None
         )
+        links_payload = [l.model_dump() for l in page.links] if page.links else None
         rows.append(
             (
                 job_id,
@@ -228,6 +240,8 @@ async def persist_pages(job_id: str, pages: list[Page]) -> list[PageSummary]:
                 chars,
                 len(page.sections),
                 sections_payload,
+                links_payload,
+                page_key(page.url) or page.url,
             )
         )
         summaries.append(
@@ -247,12 +261,57 @@ async def persist_pages(job_id: str, pages: list[Page]) -> list[PageSummary]:
                 await conn.executemany(
                     """
                     INSERT INTO pages (job_id, page_index, url, title, description,
-                                       markdown, chars, section_count, sections)
-                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                                       markdown, chars, section_count, sections,
+                                       links, url_key)
+                    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
                     """,
                     rows,
                 )
     return summaries
+
+
+async def load_page_links(
+    tenant_id: str, page_url_key: str, site_url: str | None = None
+) -> PageLinksRecord | None:
+    """Links captured from one page of the tenant's most recent completed
+    crawl. `page_url_key` is a normalized key (app/links.py::page_key), not
+    a raw URL — comparison semantics are defined in exactly one place there
+    and mirrored in voice_runtime/urls.py and widget/src/navigation.ts.
+
+    site_url omitted => the tenant's most recently started crawl, the same
+    one-site-per-tenant fallback app/salescript/store.py::load_current uses
+    (and the only mode voice_runtime can call — it never learns a site_url
+    from LiveKit dispatch metadata).
+
+    One JOIN rather than a two-step "resolve job_id, then read page": a
+    two-step read would race a re-crawl's persist_pages DELETE+INSERT
+    transaction landing in between the two queries.
+    """
+    pool = await _pool()
+    row = await pool.fetchrow(
+        """
+        SELECT j.job_id AS job_id, j.url AS site_url, p.url AS page_url, p.links
+        FROM pages p
+        JOIN jobs j ON j.job_id = p.job_id
+        WHERE j.tenant_id = $1
+          AND j.persisted = true
+          AND p.url_key = $2
+          AND ($3::text IS NULL OR j.url = $3)
+        ORDER BY j.created_at DESC
+        LIMIT 1
+        """,
+        tenant_id,
+        page_url_key,
+        site_url,
+    )
+    if row is None:
+        return None
+    return PageLinksRecord(
+        job_id=row["job_id"],
+        site_url=row["site_url"],
+        page_url=row["page_url"],
+        links=[PageLink(**item) for item in (row["links"] or [])],
+    )
 
 
 async def load_pages(job_id: str, include_content: bool = False) -> JobPages | None:

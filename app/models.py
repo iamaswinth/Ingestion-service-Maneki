@@ -99,6 +99,18 @@ class Section(BaseModel):
     children: list["Section"] = []
 
 
+class PageLink(BaseModel):
+    """An in-content <a> on a crawled page pointing at a different page of
+    the same site (app/links.py::extract_links). Backs click-based
+    navigation: the voice agent only asks the widget to click a real link
+    when the target is one of these, never a selector it invented itself.
+    """
+
+    target: str  # absolute URL as resolved at crawl time (query/hash kept)
+    target_key: str  # app/links.py::page_key(target) — the matching key
+    text: str  # normalized visible anchor text (or aria-label/title/alt)
+
+
 class Page(BaseModel):
     """One scraped page — the unit handed off to the ingestion step."""
 
@@ -107,6 +119,7 @@ class Page(BaseModel):
     description: Optional[str] = None
     markdown: str
     sections: list[Section] = []
+    links: list[PageLink] = []
 
 
 class PageSummary(BaseModel):
@@ -124,6 +137,24 @@ class JobPages(BaseModel):
     url: str
     page_count: int
     pages: list[PageSummary]
+
+
+class PageLinksRecord(BaseModel):
+    """Links captured from one page of a tenant's most recent completed
+    crawl (app/storage.py::load_page_links)."""
+
+    job_id: str
+    site_url: str
+    page_url: str
+    links: list[PageLink] = []
+
+
+class PageLinksResponse(BaseModel):
+    tenant_id: str
+    site_url: str
+    page_url: str
+    job_id: str
+    links: list[PageLink]
 
 
 class MapResult(BaseModel):

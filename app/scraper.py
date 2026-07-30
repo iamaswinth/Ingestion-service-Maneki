@@ -12,6 +12,7 @@ import httpx
 from firecrawl import AsyncFirecrawl
 
 from .config import settings
+from .links import extract_links, page_key
 from .models import Page
 from .sections import extract_sections
 
@@ -127,7 +128,21 @@ def to_pages(documents: list[Any]) -> list[Page]:
             description=description,
             markdown=markdown,
             sections=extract_sections(html),
+            links=extract_links(html, url_str),
         )
+
+    # Restrict each page's links to destinations we actually crawled. Every
+    # navigation target the agent can ever pick comes from a crawled page's
+    # chunks (ingestion/service.py only chunks job_pages.pages), so this
+    # cannot drop a usable click target — it only drops external links,
+    # uncrawled paths, and asset links, shrinking the payload voice_runtime
+    # fetches on the cold-start path. Must run after the loop above: the set
+    # of crawled URLs (and therefore of duplicate-URL "winners") is only
+    # final once every document has been seen.
+    known_keys = {page_key(u) for u in by_url}
+    for page in by_url.values():
+        page.links = [link for link in page.links if link.target_key in known_keys]
+
     return list(by_url.values())
 
 

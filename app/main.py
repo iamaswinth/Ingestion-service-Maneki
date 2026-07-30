@@ -9,6 +9,7 @@ Flow:
     POST /sales-script/{job_id}         -> kick off sales-script generation for that job's site
     GET  /sales-script/{tenant_id}      -> current sales script (any status) for a tenant
     POST /sales-script/{tenant_id}/approve -> approve a pending_review script; indexes it into chunks
+    GET  /page-links/{tenant_id}        -> links captured on one page, for click-based navigation
     POST /query                         -> hybrid (vector + lexical) search over a tenant's chunks
     GET  /map?url=                      -> preview URLs before committing to a crawl
     GET  /health                        -> Firecrawl + database reachability (diagnostic)
@@ -36,12 +37,14 @@ from .ingestion import store as ingestion_store
 from .ingestion.embedder import embed_query
 from .ingestion.embedder import warm as warm_embedder
 from .ingestion.reranker import warm as warm_reranker
+from .links import page_key
 from .models import (
     IngestResult,
     JobCreated,
     JobPages,
     JobState,
     MapResult,
+    PageLinksResponse,
     QueryRequest,
     QueryResponse,
     SalesScriptApproveResponse,
@@ -431,6 +434,33 @@ async def approve_sales_script(
         status=record.status,
         indexed_chunks=indexed,
     )
+
+
+@app.get(
+    "/page-links/{tenant_id}",
+    response_model=PageLinksResponse,
+    dependencies=[Depends(require_internal_token)],
+)
+async def get_page_links(
+    tenant_id: str,
+    page_url: str = Query(..., description="The page the visitor is currently on"),
+    site_url: Optional[str] = Query(
+        default=None, description="Omit to use the tenant's most recently started crawl"
+    ),
+) -> PageLinksResponse:
+    """Pages directly linked from `page_url` in the tenant's most recent
+    completed crawl, with the visible anchor text of each link. voice_runtime
+    fetches this once per session and uses it to decide whether a navigation
+    target can be reached by clicking a real link on the visitor's current
+    page (no reload, LiveKit survives) rather than a full page load — see
+    voice_runtime/graph/nodes.py::_pick_click_target."""
+    key = page_key(page_url)
+    if key is None:
+        raise HTTPException(status_code=400, detail="page_url must be an http(s) URL")
+    record = await storage.load_page_links(tenant_id, key, site_url)
+    if record is None:
+        raise HTTPException(status_code=404, detail="No ingested page found for this URL")
+    return PageLinksResponse(tenant_id=tenant_id, **record.model_dump())
 
 
 @app.post(
