@@ -1,3 +1,4 @@
+from decimal import Decimal
 from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl
@@ -111,6 +112,80 @@ class PageLink(BaseModel):
     text: str  # normalized visible anchor text (or aria-label/title/alt)
 
 
+# Which extraction path produced a Product — "jsonld" (schema.org/Product,
+# app/products.py) and "og" (Open Graph product:* tags, same module) are both
+# deterministic; "llm" is the async Haiku fallback
+# (app/ingestion/product_enrichment.py) for a page with neither signal. Bare
+# str would lose the ability to filter/debug by source, but a Literal keeps
+# call sites honest about which paths actually exist.
+ProductSource = Literal["jsonld", "og", "llm"]
+
+
+class Product(BaseModel):
+    """A product extracted from one crawled page — app/products.py's
+    deterministic JSON-LD/OG extraction, or app/ingestion/product_enrichment.py's
+    LLM fallback. Backs GET /products/{tenant_id}: catalog search for
+    "suggest alternatives" and grounding "what's in stock" in real data
+    instead of retrieval prose.
+
+    `product_key` is deliberately Optional here: extraction
+    (app/products.py::extract_products) runs inside app/scraper.py::to_pages,
+    which has no tenant_id/site_url in scope to hash into a key. It is filled
+    in by app/storage.py at persistence time (see
+    app/products.py::make_product_key) and is always populated by the time a
+    Product reaches an API response.
+    """
+
+    product_key: Optional[str] = None
+    page_url: str
+    name: str
+    sku: Optional[str] = None
+    price_amount: Optional[Decimal] = None
+    price_currency: Optional[str] = None
+    # Raw schema.org (e.g. "https://schema.org/InStock") or OG
+    # (product:availability) value, intentionally not normalized to a fixed
+    # enum — platforms don't agree on one, and a bare str never invalidates
+    # on a value this code hasn't seen yet.
+    availability: Optional[str] = None
+    image_url: Optional[str] = None
+    description: Optional[str] = None
+    # Size/color/variant labels — no fixed shape across platforms.
+    attributes: dict[str, str] = {}
+    source: ProductSource
+
+
+# What a captured control does. "other" is a deliberate catch-all (mirrors
+# SiteArchetype's "other") — an action's usefulness as a click target isn't
+# limited to the kinds named here.
+ActionKind = Literal[
+    "add_to_cart",
+    "buy_now",
+    "checkout",
+    "view_cart",
+    "select_variant",
+    "quantity",
+    "search",
+    "filter",
+    "other",
+]
+
+
+class PageAction(BaseModel):
+    """A clickable control captured on one page (app/actions.py). Backs
+    click-based cart actions the same way PageLink backs click-based
+    navigation — the agent may only ever act on a handle ingestion actually
+    verified exists on the page, never invent a selector."""
+
+    kind: ActionKind
+    label: str  # accessible name: text -> aria-label -> title -> img alt
+    role: str  # "button" | "link" | "input" | "select"
+    selectors: list[str]  # priority-ordered fallback bundle, most-specific first
+    # Only ever populated for a single-product page — see app/actions.py's
+    # module docstring for the documented multi-product-page limitation.
+    product_key: Optional[str] = None
+    section_id: Optional[str] = None
+
+
 class Page(BaseModel):
     """One scraped page — the unit handed off to the ingestion step."""
 
@@ -120,6 +195,8 @@ class Page(BaseModel):
     markdown: str
     sections: list[Section] = []
     links: list[PageLink] = []
+    products: list[Product] = []
+    page_actions: list[PageAction] = []
 
 
 class PageSummary(BaseModel):
@@ -155,6 +232,35 @@ class PageLinksResponse(BaseModel):
     page_url: str
     job_id: str
     links: list[PageLink]
+
+
+class PageActionsRecord(BaseModel):
+    """Clickable controls captured from one page of a tenant's most recent
+    completed crawl (app/storage.py::load_page_actions) — mirrors
+    PageLinksRecord exactly."""
+
+    job_id: str
+    site_url: str
+    page_url: str
+    page_actions: list[PageAction] = []
+
+
+class PageActionsResponse(BaseModel):
+    tenant_id: str
+    site_url: str
+    page_url: str
+    job_id: str
+    page_actions: list[PageAction]
+
+
+class ProductsResponse(BaseModel):
+    """GET /products/{tenant_id} — catalog search backing "suggest
+    alternatives" and grounding "what's in stock" in real data. Not scoped
+    to one page/job like PageLinksResponse/PageActionsResponse: a product
+    search spans the whole tenant catalog."""
+
+    tenant_id: str
+    products: list[Product]
 
 
 class MapResult(BaseModel):
@@ -217,6 +323,13 @@ class QueryRequest(BaseModel):
     rerank: Optional[bool] = None
     # When true, populate QueryHit.vector_score/lexical_score/rerank_score for tuning.
     debug: bool = False
+    # Constrain to one content_type (e.g. "faq") or one kind
+    # ("content"/"question"/"sales_script") — orthogonal filters, both
+    # None by default (no constraint). See
+    # app/ingestion/store.py::_build_conditions for precedence when kind
+    # is given explicitly.
+    content_type: Optional[ContentType] = None
+    kind: Optional[Literal["content", "question", "sales_script"]] = None
 
 
 class QueryHit(BaseModel):

@@ -86,6 +86,14 @@ class Settings(BaseSettings):
     # timeout here just means fewer questions, never a failed ingest.
     question_gen_timeout_seconds: float = 60.0
 
+    # --- Product LLM fallback (app/ingestion/product_enrichment.py) ---
+    # For a page with neither JSON-LD nor Open Graph product signal
+    # (app/products.py) — reuses anthropic_api_key above. Silently skipped
+    # (same fail-open pattern as doc2query) with no key set.
+    product_llm_fallback_enabled: bool = True
+    product_llm_fallback_model: str = "claude-haiku-4-5"
+    product_llm_fallback_timeout_seconds: float = 60.0
+
     # --- Hybrid retrieval: dense vector + Postgres full-text, fused via RRF ---
     hybrid_search_enabled: bool = True
     hybrid_rrf_k: int = 60

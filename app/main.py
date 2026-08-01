@@ -10,6 +10,8 @@ Flow:
     GET  /sales-script/{tenant_id}      -> current sales script (any status) for a tenant
     POST /sales-script/{tenant_id}/approve -> approve a pending_review script; indexes it into chunks
     GET  /page-links/{tenant_id}        -> links captured on one page, for click-based navigation
+    GET  /page-actions/{tenant_id}      -> clickable controls captured on one page (add-to-cart, ...)
+    GET  /products/{tenant_id}          -> catalog search over a tenant's extracted products
     POST /query                         -> hybrid (vector + lexical) search over a tenant's chunks
     GET  /map?url=                      -> preview URLs before committing to a crawl
     GET  /health                        -> Firecrawl + database reachability (diagnostic)
@@ -20,6 +22,7 @@ import asyncio
 import contextlib
 import logging
 from contextlib import asynccontextmanager
+from decimal import Decimal
 from typing import Optional
 
 from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Response
@@ -44,7 +47,9 @@ from .models import (
     JobPages,
     JobState,
     MapResult,
+    PageActionsResponse,
     PageLinksResponse,
+    ProductsResponse,
     QueryRequest,
     QueryResponse,
     SalesScriptApproveResponse,
@@ -267,7 +272,7 @@ async def _advance_scrape(job_id: str) -> tuple[JobState | None, bool]:
 
     try:
         pages = scraper.to_pages(live["data"])
-        summaries = await storage.persist_pages(job_id, pages)
+        summaries = await storage.persist_pages(job_id, claimed.tenant_id, claimed.url, pages)
     except Exception as exc:
         await storage.revert_persisting(job_id, str(exc))
         raise RuntimeError(f"Failed to persist pages: {exc}") from exc
@@ -463,6 +468,61 @@ async def get_page_links(
     return PageLinksResponse(tenant_id=tenant_id, **record.model_dump())
 
 
+@app.get(
+    "/page-actions/{tenant_id}",
+    response_model=PageActionsResponse,
+    dependencies=[Depends(require_internal_token)],
+)
+async def get_page_actions(
+    tenant_id: str,
+    page_url: str = Query(..., description="The page the visitor is currently on"),
+    site_url: Optional[str] = Query(
+        default=None, description="Omit to use the tenant's most recently started crawl"
+    ),
+) -> PageActionsResponse:
+    """Clickable controls captured on `page_url` in the tenant's most recent
+    completed crawl — mirrors GET /page-links exactly (same JOIN, same
+    most-recent-crawl fallback). The voice shopping agent uses this to
+    decide what it may click (add-to-cart, checkout, ...), never inventing
+    a selector of its own — see app/actions.py."""
+    key = page_key(page_url)
+    if key is None:
+        raise HTTPException(status_code=400, detail="page_url must be an http(s) URL")
+    record = await storage.load_page_actions(tenant_id, key, site_url)
+    if record is None:
+        raise HTTPException(status_code=404, detail="No ingested page found for this URL")
+    return PageActionsResponse(tenant_id=tenant_id, **record.model_dump())
+
+
+@app.get(
+    "/products/{tenant_id}",
+    response_model=ProductsResponse,
+    dependencies=[Depends(require_internal_token)],
+)
+async def get_products(
+    tenant_id: str,
+    q: Optional[str] = Query(default=None, description="Search text; omit for a plain listing"),
+    price_min: Optional[Decimal] = Query(default=None, ge=0),
+    price_max: Optional[Decimal] = Query(default=None, ge=0),
+    availability: Optional[str] = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=100),
+) -> ProductsResponse:
+    """Catalog search for the voice shopping agent — "suggest alternatives",
+    "what's in stock" — grounded in real product data (app/products.py,
+    app/ingestion/product_enrichment.py) instead of retrieval prose.
+    Omitting `q` returns a plain listing, most recently crawled first."""
+    query_embedding = await asyncio.to_thread(embed_query, q) if q else None
+    products = await storage.search_products(
+        tenant_id=tenant_id,
+        query_embedding=query_embedding,
+        price_min=price_min,
+        price_max=price_max,
+        availability=availability,
+        limit=limit,
+    )
+    return ProductsResponse(tenant_id=tenant_id, products=products)
+
+
 @app.post(
     "/query", response_model=QueryResponse, dependencies=[Depends(require_internal_token)]
 )
@@ -478,6 +538,8 @@ async def query(req: QueryRequest) -> QueryResponse:
         hybrid=req.hybrid,
         debug=req.debug,
         rerank=req.rerank,
+        content_type=req.content_type,
+        kind=req.kind,
     )
     return QueryResponse(hits=hits)
 

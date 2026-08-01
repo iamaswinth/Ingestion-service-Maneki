@@ -11,9 +11,11 @@ from typing import Any, Optional
 import httpx
 from firecrawl import AsyncFirecrawl
 
+from .actions import extract_actions
 from .config import settings
 from .links import extract_links, page_key
 from .models import Page
+from .products import extract_products
 from .sections import extract_sections
 
 _client = AsyncFirecrawl(
@@ -41,9 +43,17 @@ def _get(obj: Any, *names: str, default: Any = None) -> Any:
 def _scrape_options(wait_for_ms: int) -> dict:
     # markdown = clean text for ingestion; html = kept so we can recover the
     # id-anchored section structure that markdown conversion discards.
-    # wait_for lets client-side-rendered pages hydrate before we capture them.
+    # rawHtml = the untouched document *before* only_main_content stripping —
+    # nav/header/footer, <button>s, and <script type="application/ld+json">
+    # all survive here even though they never reach html/markdown (Firecrawl's
+    # own pipeline is rawHtml -> html -> markdown, so requesting rawHtml
+    # changes nothing about what those two contain). Feeds extract_links
+    # (app/links.py) and extract_products/extract_actions (app/products.py,
+    # app/actions.py) — never persisted itself, only its extracted structure
+    # is. wait_for lets client-side-rendered pages hydrate before we capture
+    # them.
     return {
-        "formats": ["markdown", "html"],
+        "formats": ["markdown", "html", "rawHtml"],
         "only_main_content": True,
         "wait_for": wait_for_ms,
     }
@@ -112,6 +122,13 @@ def to_pages(documents: list[Any]) -> list[Page]:
     for doc in documents:
         markdown = _get(doc, "markdown", default="") or ""
         html = _get(doc, "html", "raw_html", "rawHtml", default="") or ""
+        # The untouched pre-strip document — deliberately a SEPARATE read
+        # from `html` above. That fallback chain exists in case "html" were
+        # ever absent from the response; here we want the raw document
+        # specifically, and the installed firecrawl-py SDK normalizes the
+        # wire field "rawHtml" to the attribute/key "raw_html" (confirmed
+        # against the SDK source), so that spelling is checked first.
+        raw_html = _get(doc, "raw_html", "rawHtml", default="") or ""
         metadata = _get(doc, "metadata", default={}) or {}
         url = _get(metadata, "source_url", "sourceURL", "url", default="") or ""
         title = _get(metadata, "title", "og_title", "ogTitle")
@@ -127,8 +144,15 @@ def to_pages(documents: list[Any]) -> list[Page]:
             title=title,
             description=description,
             markdown=markdown,
+            # Content structure comes from the main-content-only html: a
+            # nav/header/footer section chunked as if it were page content
+            # would just be noise. Links/products/actions instead want the
+            # untouched raw_html — see app/links.py's (now resolved) v1
+            # limitation note, app/products.py, and app/actions.py.
             sections=extract_sections(html),
-            links=extract_links(html, url_str),
+            links=extract_links(raw_html, url_str),
+            products=extract_products(raw_html, url_str),
+            page_actions=extract_actions(raw_html, url_str),
         )
 
     # Restrict each page's links to destinations we actually crawled. Every

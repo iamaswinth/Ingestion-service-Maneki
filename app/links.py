@@ -17,10 +17,12 @@ byte-identical: `voice_runtime/urls.py::page_key` (Python) and
 worked-example table. Changing the semantics here without updating both is a
 cross-repo break.
 
-Known v1 limitation: `app/scraper.py` requests Firecrawl with
-`only_main_content: True`, which strips `<nav>`/`<header>`/`<footer>` before
-this module ever sees the HTML — so only in-content links are captured, not
-site-wide nav menus (arguably the links most likely to be SPA-routed).
+`app/scraper.py::to_pages` feeds this the untouched `rawHtml` Firecrawl
+returns, not the `only_main_content`-stripped `html` — so site nav, category
+menus, and the header cart link (the links most likely to be SPA-routed) are
+captured too, not just in-content links. This was a known v1 limitation
+(only in-content links were visible) until `rawHtml` was added to
+`app/scraper.py`'s requested formats.
 """
 
 import posixpath

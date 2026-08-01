@@ -248,6 +248,8 @@ def _build_conditions(
     site_url: Optional[str],
     page_url: Optional[str],
     include_questions: bool = True,
+    content_type: Optional[str] = None,
+    kind: Optional[str] = None,
 ) -> tuple[list[str], list]:
     conditions = ["tenant_id = $1"]
     params: list = [tenant_id]
@@ -257,7 +259,18 @@ def _build_conditions(
     if page_url:
         params.append(page_url)
         conditions.append(f"page_url = ${len(params)}")
-    if not include_questions:
+    if content_type:
+        params.append(content_type)
+        conditions.append(f"content_type = ${len(params)}")
+    if kind:
+        # An explicit kind ask (e.g. "only sales_script") is a stronger,
+        # more specific constraint than the include_questions default below
+        # — applying both could be self-contradictory (kind='question' AND
+        # kind != 'question' is never satisfiable), so an explicit kind wins
+        # outright rather than being combined with it.
+        params.append(kind)
+        conditions.append(f"kind = ${len(params)}")
+    elif not include_questions:
         # No placeholder needed: 'question' is a fixed literal, not caller
         # input. Lets scripts/eval_retrieval.py (and any future caller) A/B
         # doc2query's contribution against a live tenant without a re-ingest.
@@ -272,9 +285,13 @@ async def _search_vector_only(
     site_url: Optional[str],
     page_url: Optional[str],
     include_questions: bool = True,
+    content_type: Optional[str] = None,
+    kind: Optional[str] = None,
 ) -> list[QueryHit]:
     pool = await get_pool()
-    conditions, params = _build_conditions(tenant_id, site_url, page_url, include_questions)
+    conditions, params = _build_conditions(
+        tenant_id, site_url, page_url, include_questions, content_type, kind
+    )
 
     params.append(embedding)
     embedding_idx = len(params)
@@ -380,6 +397,8 @@ async def _search_hybrid(
     page_url: Optional[str],
     debug: bool,
     include_questions: bool = True,
+    content_type: Optional[str] = None,
+    kind: Optional[str] = None,
 ) -> list[QueryHit]:
     """Vector + Postgres full-text, fused via Reciprocal Rank Fusion (RRF).
 
@@ -392,7 +411,9 @@ async def _search_hybrid(
     question (either leg) still collapses to one row.
     """
     pool = await get_pool()
-    conditions, params = _build_conditions(tenant_id, site_url, page_url, include_questions)
+    conditions, params = _build_conditions(
+        tenant_id, site_url, page_url, include_questions, content_type, kind
+    )
     where_clause = " AND ".join(conditions)
 
     params.append(question)
@@ -608,6 +629,8 @@ async def search(
     debug: bool = False,
     rerank: Optional[bool] = None,
     include_questions: bool = True,
+    content_type: Optional[str] = None,
+    kind: Optional[str] = None,
 ) -> list[QueryHit]:
     use_hybrid = settings.hybrid_search_enabled if hybrid is None else hybrid
     use_rerank = settings.rerank_enabled if rerank is None else rerank
@@ -630,18 +653,20 @@ async def search(
 
     if not use_hybrid:
         hits = await _search_vector_only(
-            tenant_id, embedding, fetch_k, site_url, page_url, include_questions
+            tenant_id, embedding, fetch_k, site_url, page_url, include_questions,
+            content_type, kind,
         )
     else:
         try:
             hits = await _search_hybrid(
                 tenant_id, embedding, question, fetch_k, site_url, page_url, debug,
-                include_questions,
+                include_questions, content_type, kind,
             )
         except Exception:
             logger.exception("Hybrid search failed; falling back to vector-only")
             hits = await _search_vector_only(
-                tenant_id, embedding, fetch_k, site_url, page_url, include_questions
+                tenant_id, embedding, fetch_k, site_url, page_url, include_questions,
+                content_type, kind,
             )
 
     if use_rerank and hits:

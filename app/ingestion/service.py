@@ -9,6 +9,7 @@ from ..models import Chunk, Page, PageSummary
 from . import store
 from .chunker import chunk_page
 from .embedder import embed_documents
+from .product_enrichment import enrich_products
 from .questions import build_question_chunks, generate_questions
 
 logger = logging.getLogger(__name__)
@@ -80,6 +81,21 @@ async def ingest_job(job_id: str) -> tuple[int, int]:
             extra={"job_id": job_id, "tenant_id": job.tenant_id, "site_url": job.url},
         )
         return 0, 0
+
+    # Independent of chunking/embedding below: this only needs job_pages'
+    # markdown (already loaded, include_content=True above) and the
+    # deterministic products persist_pages already wrote for this site
+    # before ingest_job ever ran. Fail-open (see product_enrichment.py's
+    # module docstring) — never blocks the rest of ingestion.
+    try:
+        enriched_count = await enrich_products(job.tenant_id, job.url, job_id, job_pages)
+        if enriched_count:
+            logger.info(
+                "product LLM fallback added products",
+                extra={"job_id": job_id, "tenant_id": job.tenant_id, "count": enriched_count},
+            )
+    except Exception:
+        logger.warning("product LLM fallback enrichment failed", exc_info=True)
 
     content_chunks = [
         chunk

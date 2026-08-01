@@ -219,8 +219,11 @@ class TestRealBaseline:
             "0002_chunk_site_index",
             "0003_sales_script_site_profile",
             "0004_page_links",
+            "0005_products_and_actions",
         ]
-        assert {"jobs", "pages", "chunks", "sales_scripts"} <= await _tables(scratch_schema)
+        assert {"jobs", "pages", "chunks", "sales_scripts", "products"} <= await _tables(
+            scratch_schema
+        )
 
     async def test_the_baseline_is_safe_on_a_database_that_already_has_the_tables(
         self, scratch_schema
@@ -237,4 +240,5 @@ class TestRealBaseline:
             "0002_chunk_site_index",
             "0003_sales_script_site_profile",
             "0004_page_links",
+            "0005_products_and_actions",
         ]

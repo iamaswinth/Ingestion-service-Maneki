@@ -138,15 +138,21 @@ def test_extract_links_truncates_long_anchor_text():
 def test_to_pages_filters_links_to_uncrawled_destinations():
     from app.scraper import to_pages
 
+    # extract_links now runs against rawHtml (the untouched pre-strip
+    # document), not html (only_main_content-stripped) — see app/scraper.py's
+    # to_pages. rawHtml carries the same markup here since this fixture
+    # doesn't need to exercise the html/rawHtml divergence itself.
     docs = [
         {
             "markdown": "Home page content here.",
             "html": '<a href="https://x.com/about">About</a><a href="https://external.com/">External</a>',
+            "rawHtml": '<a href="https://x.com/about">About</a><a href="https://external.com/">External</a>',
             "metadata": {"sourceURL": "https://x.com/"},
         },
         {
             "markdown": "About page content here.",
             "html": "<p>About us.</p>",
+            "rawHtml": "<p>About us.</p>",
             "metadata": {"sourceURL": "https://x.com/about"},
         },
     ]
@@ -157,13 +163,59 @@ def test_to_pages_filters_links_to_uncrawled_destinations():
     assert not any("external.com" in t for t in targets)
 
 
+def test_to_pages_extracts_links_from_raw_html_not_stripped_html():
+    # The whole point of routing extract_links onto rawHtml: a nav link only
+    # present in the untouched document (never in the only_main_content-
+    # stripped html) must still be captured.
+    from app.scraper import to_pages
+
+    docs = [
+        {
+            "markdown": "Home page content here.",
+            "html": "<main>Home page content here.</main>",  # nav stripped
+            "rawHtml": (
+                '<nav><a href="https://x.com/shop">Shop</a></nav>'
+                "<main>Home page content here.</main>"
+            ),
+            "metadata": {"sourceURL": "https://x.com/"},
+        },
+        {
+            "markdown": "Shop page content here.",
+            "html": "<p>Shop page content here.</p>",
+            "rawHtml": "<p>Shop page content here.</p>",
+            "metadata": {"sourceURL": "https://x.com/shop"},
+        },
+    ]
+    pages = to_pages(docs)
+    home = next(p for p in pages if p.url == "https://x.com/")
+    assert "https://x.com/shop" in {l.target_key for l in home.links}
+
+
+def test_to_pages_falls_back_to_html_when_raw_html_absent():
+    # A document that never included rawHtml (e.g. an older cached crawl, or
+    # a Firecrawl response missing the field) degrades to no links rather
+    # than raising — extract_links([]) on an empty string is already a
+    # defined, tested no-op.
+    from app.scraper import to_pages
+
+    docs = [
+        {
+            "markdown": "Home page content here.",
+            "html": '<a href="https://x.com/about">About</a>',
+            "metadata": {"sourceURL": "https://x.com/"},
+        },
+    ]
+    pages = to_pages(docs)
+    assert pages[0].links == []
+
+
 # ---- storage.load_page_links (DB) --------------------------------------------
 
 
 async def _seed_crawl(tenant_id: str, site_url: str, job_id: str, pages: list[Page]) -> None:
     await storage.create_job(job_id, site_url, tenant_id)
     await storage.mark_persisting(job_id, len(pages))
-    await storage.persist_pages(job_id, pages)
+    await storage.persist_pages(job_id, tenant_id, site_url, pages)
 
 
 async def _cleanup_jobs(*job_ids: str) -> None:
